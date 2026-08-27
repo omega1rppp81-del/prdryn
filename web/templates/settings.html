@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Настройки — Совет{% endblock %}
+{% block content %}
+<div class="space-y-6">
+    <h1 class="text-2xl font-bold">Настройки сервера</h1>
+    <div id="settings-form" class="bg-discord-sidebar rounded-xl p-6 border border-gray-700 max-w-2xl">
+        <p class="text-gray-400">Настройки сервера доступны через команды Discord:</p>
+        <div class="mt-4 space-y-2 text-sm">
+            <p><code class="bg-discord-input px-2 py-1 rounded">/configure</code> — текущие настройки</p>
+            <p><code class="bg-discord-input px-2 py-1 rounded">/configure vote_channel:#канал</code> — канал голосований</p>
+            <p><code class="bg-discord-input px-2 py-1 rounded">/configure council_role:@роль</code> — роль Совета</p>
+            <p><code class="bg-discord-input px-2 py-1 rounded">/configure admin_role:@роль</code> — роль администраторов</p>
+        </div>
+    </div>
+</div>
+{% endblock %}

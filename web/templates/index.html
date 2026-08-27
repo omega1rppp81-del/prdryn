@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}Совет — Панель управления{% endblock %}
+{% block content %}
+<div class="space-y-8">
+    <div>
+        <h1 class="text-3xl font-bold mb-2">Панель управления голосованиями</h1>
+        <p class="text-gray-400">Система голосований Совета</p>
+    </div>
+
+    {% if not user %}
+    <div class="bg-discord-sidebar rounded-xl p-8 text-center">
+        <h2 class="text-xl font-semibold mb-4">Войдите через Discord</h2>
+        <p class="text-gray-400 mb-6">Для доступа к панели управления необходима авторизация</p>
+        <a href="/api/auth/login" class="bg-discord-brand hover:bg-indigo-600 px-6 py-3 rounded-lg text-white font-semibold inline-block">
+            Войти через Discord
+        </a>
+    </div>
+    {% else %}
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4" id="stats-grid">
+        <div class="bg-discord-sidebar rounded-xl p-4 border border-gray-700">
+            <p class="text-gray-400 text-sm">Всего голосований</p>
+            <p class="text-2xl font-bold" id="stat-total">—</p>
+        </div>
+        <div class="bg-discord-sidebar rounded-xl p-4 border border-gray-700">
+            <p class="text-gray-400 text-sm">Активных</p>
+            <p class="text-2xl font-bold text-discord-green" id="stat-active">—</p>
+        </div>
+        <div class="bg-discord-sidebar rounded-xl p-4 border border-gray-700">
+            <p class="text-gray-400 text-sm">Завершённых</p>
+            <p class="text-2xl font-bold text-discord-brand" id="stat-completed">—</p>
+        </div>
+        <div class="bg-discord-sidebar rounded-xl p-4 border border-gray-700">
+            <p class="text-gray-400 text-sm">Отменённых</p>
+            <p class="text-2xl font-bold text-discord-red" id="stat-cancelled">—</p>
+        </div>
+    </div>
+
+    <div>
+        <h2 class="text-xl font-semibold mb-4">Выберите сервер</h2>
+        <div id="guilds-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <p class="text-gray-400">Загрузка...</p>
+        </div>
+    </div>
+
+    <div>
+        <h2 class="text-xl font-semibold mb-4">Последние голосования</h2>
+        <div id="recent-votes" class="space-y-3">
+            <p class="text-gray-400">Загрузка...</p>
+        </div>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% if user %}
+<script>
+    const user = {{ user | tojson }};
+    let selectedGuild = null;
+
+    async function loadGuilds() {
+        const guilds = user.guilds || [];
+        const container = document.getElementById('guilds-list');
+        if (guilds.length === 0) {
+            container.innerHTML = '<p class="text-gray-400">Нет доступных серверов</p>';
+            return;
+        }
+        container.innerHTML = guilds.map(g => `
+            <div class="bg-discord-sidebar rounded-xl p-4 border border-gray-700 cursor-pointer hover:border-discord-brand transition"
+                 onclick="selectGuild('${g.id}', '${g.name}')">
+                ${g.icon ? `<img src="https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png" class="w-12 h-12 rounded-full mb-2">` : ''}
+                <h3 class="font-semibold">${g.name}</h3>
+            </div>
+        `).join('');
+    }
+
+    async function selectGuild(guildId, guildName) {
+        selectedGuild = guildId;
+        document.querySelectorAll('#guilds-list > div').forEach(el => el.classList.remove('border-discord-brand'));
+        event.currentTarget.classList.add('border-discord-brand');
+
+        try {
+            const [statsRes, votesRes] = await Promise.all([
+                fetch(`/api/guilds/${guildId}/stats`),
+                fetch(`/api/guilds/${guildId}/votes?limit=5`)
+            ]);
+            const stats = await statsRes.json();
+            const votes = await votesRes.json();
+
+            document.getElementById('stat-total').textContent = stats.total;
+            document.getElementById('stat-active').textContent = stats.active;
+            document.getElementById('stat-completed').textContent = stats.completed;
+            document.getElementById('stat-cancelled').textContent = stats.cancelled;
+
+            const votesContainer = document.getElementById('recent-votes');
+            if (votes.length === 0) {
+                votesContainer.innerHTML = '<p class="text-gray-400">Нет голосований</p>';
+            } else {
+                votesContainer.innerHTML = votes.map(v => `
+                    <a href="/votes/${v.id}" class="block bg-discord-sidebar rounded-lg p-4 border border-gray-700 hover:border-discord-brand transition">
+                        <div class="flex justify-between items-center">
+                            <div>
+                                <span class="text-gray-500">#${v.vote_number}</span>
+                                <span class="font-semibold ml-2">${v.title}</span>
+                            </div>
+                            <span class="px-2 py-1 rounded text-xs ${
+                                v.status === 'open' ? 'bg-green-900 text-green-300' :
+                                v.status === 'completed' ? 'bg-blue-900 text-blue-300' :
+                                v.status === 'cancelled' ? 'bg-red-900 text-red-300' :
+                                'bg-gray-700 text-gray-300'
+                            }">${v.status}</span>
+                        </div>
+                    </a>
+                `).join('');
+            }
+        } catch (e) {
+            console.error('Error loading data:', e);
+        }
+    }
+
+    loadGuilds();
+</script>
+{% endif %}
+{% endblock %}

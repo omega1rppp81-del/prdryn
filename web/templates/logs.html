@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Журнал — Совет{% endblock %}
+{% block content %}
+<div class="space-y-6">
+    <h1 class="text-2xl font-bold">Журнал действий</h1>
+
+    <div class="flex space-x-2">
+        <select id="action-filter" class="bg-discord-input border border-gray-600 rounded-lg px-3 py-2 text-sm">
+            <option value="">Все действия</option>
+            <option value="vote_created">Создание</option>
+            <option value="published">Публикация</option>
+            <option value="vote_cast">Голос</option>
+            <option value="vote_changed">Изменение голоса</option>
+            <option value="early_completion">Досрочное завершение</option>
+            <option value="cancelled">Отмена</option>
+            <option value="approved">Одобрение</option>
+            <option value="rejected">Отклонение</option>
+        </select>
+    </div>
+
+    <div class="bg-discord-sidebar rounded-xl border border-gray-700 overflow-hidden">
+        <table class="w-full text-sm">
+            <thead class="bg-discord-input">
+                <tr>
+                    <th class="px-4 py-3 text-left font-semibold text-gray-300">Дата</th>
+                    <th class="px-4 py-3 text-left font-semibold text-gray-300">Действие</th>
+                    <th class="px-4 py-3 text-left font-semibold text-gray-300">Пользователь</th>
+                    <th class="px-4 py-3 text-left font-semibold text-gray-300">Голосование</th>
+                    <th class="px-4 py-3 text-left font-semibold text-gray-300">Детали</th>
+                </tr>
+            </thead>
+            <tbody id="logs-body">
+                <tr><td colspan="5" class="px-4 py-8 text-center text-gray-400">Загрузка...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const user = {{ user | tojson }};
+
+    const actionLabels = {
+        vote_created: '📝 Создано',
+        draft_edited: '✏️ Черновик изменён',
+        sent_for_approval: '📤 Отправлено на согласование',
+        approved: '✅ Одобрено',
+        rejected: '❌ Отклонено',
+        published: '📢 Опубликовано',
+        vote_cast: '🗳️ Голос',
+        vote_changed: '🔄 Голос изменён',
+        vote_revoked: '↩️ Голос отозван',
+        reminder_sent: '🔔 Напоминание',
+        paused: '⏸️ Приостановлено',
+        resumed: '▶️ Возобновлено',
+        extended: '⏰ Продлено',
+        early_completion: '⏹️ Досрочное завершение',
+        auto_completed: '🤖 Автозавершение',
+        cancelled: '🚫 Отменено',
+        exported: '📥 Экспорт',
+    };
+
+    async function loadLogs() {
+        if (!user.guilds || !user.guilds.length) return;
+        const guildId = user.guilds[0].id;
+        const action = document.getElementById('action-filter').value;
+        const params = action ? `?action=${action}` : '';
+
+        const res = await fetch(`/api/guilds/${guildId}/logs${params}`);
+        const logs = await res.json();
+        const tbody = document.getElementById('logs-body');
+
+        if (logs.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-8 text-center text-gray-400">Нет записей</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = logs.map(l => `
+            <tr class="border-t border-gray-700 hover:bg-discord-input">
+                <td class="px-4 py-3 text-gray-400">${l.created_at ? new Date(l.created_at).toLocaleString('ru-RU') : '—'}</td>
+                <td class="px-4 py-3">${actionLabels[l.action] || l.action}</td>
+                <td class="px-4 py-3">${l.user_name || l.user_id}</td>
+                <td class="px-4 py-3">${l.vote_id ? '#' + l.vote_id : '—'}</td>
+                <td class="px-4 py-3 text-gray-400 text-xs">${l.details ? JSON.stringify(l.details).substring(0, 100) : '—'}</td>
+            </tr>
+        `).join('');
+    }
+
+    document.getElementById('action-filter').addEventListener('change', loadLogs);
+    loadLogs();
+</script>
+{% endblock %}

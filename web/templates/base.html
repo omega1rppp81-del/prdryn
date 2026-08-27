@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Совет — Голосования{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        discord: {
+                            bg: '#313338',
+                            sidebar: '#2b2d31',
+                            input: '#383a40',
+                            brand: '#5865f2',
+                            green: '#57f287',
+                            red: '#ed4245',
+                            yellow: '#fee75c',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { font-family: 'gg sans', 'Noto Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif; }
+    </style>
+</head>
+<body class="dark bg-discord-bg text-gray-100 min-h-screen">
+    <nav class="bg-discord-sidebar border-b border-gray-700 px-4 py-3">
+        <div class="max-w-7xl mx-auto flex items-center justify-between">
+            <div class="flex items-center space-x-6">
+                <a href="/" class="text-xl font-bold text-discord-brand">Совет</a>
+                {% if user %}
+                <a href="/votes" class="text-gray-300 hover:text-white">Голосования</a>
+                <a href="/analytics" class="text-gray-300 hover:text-white">Аналитика</a>
+                <a href="/logs" class="text-gray-300 hover:text-white">Журнал</a>
+                <a href="/settings" class="text-gray-300 hover:text-white">Настройки</a>
+                {% endif %}
+            </div>
+            <div class="flex items-center space-x-4">
+                {% if user %}
+                    <span class="text-gray-300">{{ user.username }}</span>
+                    <a href="/api/auth/logout" class="text-red-400 hover:text-red-300">Выйти</a>
+                {% else %}
+                    <a href="/api/auth/login" class="bg-discord-brand hover:bg-indigo-600 px-4 py-2 rounded-lg text-white">
+                        Войти через Discord
+                    </a>
+                {% endif %}
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-4 py-6">
+        {% block content %}{% endblock %}
+    </main>
+
+    {% block scripts %}{% endblock %}
+</body>
+</html>

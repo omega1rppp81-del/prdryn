@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Аналитика — Совет{% endblock %}
+{% block content %}
+<div class="space-y-6">
+    <h1 class="text-2xl font-bold">Аналитика</h1>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4" id="analytics-stats"></div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-discord-sidebar rounded-xl p-6 border border-gray-700">
+            <h2 class="text-lg font-semibold mb-4">Голосования по статусам</h2>
+            <canvas id="statusChart" height="200"></canvas>
+        </div>
+        <div class="bg-discord-sidebar rounded-xl p-6 border border-gray-700">
+            <h2 class="text-lg font-semibold mb-4">Активность по месяцам</h2>
+            <canvas id="activityChart" height="200"></canvas>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const user = {{ user | tojson }};
+
+    async function loadAnalytics() {
+        if (!user.guilds || !user.guilds.length) return;
+        const guildId = user.guilds[0].id;
+
+        const res = await fetch(`/api/guilds/${guildId}/stats`);
+        const stats = await res.json();
+
+        document.getElementById('analytics-stats').innerHTML = `
+            <div class="bg-discord-sidebar rounded-xl p-4 border border-gray-700">
+                <p class="text-gray-400 text-sm">Всего</p>
+                <p class="text-2xl font-bold">${stats.total}</p>
+            </div>
+            <div class="bg-discord-sidebar rounded-xl p-4 border border-gray-700">
+                <p class="text-gray-400 text-sm">Активных</p>
+                <p class="text-2xl font-bold text-green-400">${stats.active}</p>
+            </div>
+            <div class="bg-discord-sidebar rounded-xl p-4 border border-gray-700">
+                <p class="text-gray-400 text-sm">Завершённых</p>
+                <p class="text-2xl font-bold text-blue-400">${stats.completed}</p>
+            </div>
+            <div class="bg-discord-sidebar rounded-xl p-4 border border-gray-700">
+                <p class="text-gray-400 text-sm">Отменённых</p>
+                <p class="text-2xl font-bold text-red-400">${stats.cancelled}</p>
+            </div>
+        `;
+    }
+
+    loadAnalytics();
+</script>
+{% endblock %}

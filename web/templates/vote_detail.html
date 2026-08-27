@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+{% block title %}Голосование — Совет{% endblock %}
+{% block content %}
+<div class="space-y-6" id="vote-app">
+    <div class="flex justify-between items-center">
+        <div>
+            <h1 class="text-2xl font-bold" id="vote-title">Загрузка...</h1>
+            <p class="text-gray-400" id="vote-subtitle"></p>
+        </div>
+        <div class="flex space-x-2" id="admin-actions" style="display:none;">
+            <button onclick="pauseVote()" class="bg-yellow-600 hover:bg-yellow-700 px-4 py-2 rounded-lg text-sm">Приостановить</button>
+            <button onclick="completeVote()" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg text-sm">Завершить</button>
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div class="lg:col-span-2 space-y-6">
+            <div class="bg-discord-sidebar rounded-xl p-6 border border-gray-700">
+                <h2 class="text-lg font-semibold mb-4">Информация</h2>
+                <div class="grid grid-cols-2 gap-4 text-sm" id="vote-info"></div>
+            </div>
+
+            <div class="bg-discord-sidebar rounded-xl p-6 border border-gray-700" id="results-section">
+                <h2 class="text-lg font-semibold mb-4">Результаты</h2>
+                <div id="results-bars" class="space-y-3"></div>
+            </div>
+
+            <div class="bg-discord-sidebar rounded-xl p-6 border border-gray-700">
+                <h2 class="text-lg font-semibold mb-4">Участники</h2>
+                <div id="participants-table">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-gray-400 border-b border-gray-700">
+                                <th class="text-left py-2">Участник</th>
+                                <th class="text-left py-2">Голос</th>
+                                <th class="text-left py-2">Время</th>
+                            </tr>
+                        </thead>
+                        <tbody id="participants-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="space-y-6">
+            <div class="bg-discord-sidebar rounded-xl p-6 border border-gray-700">
+                <h2 class="text-lg font-semibold mb-4">Статистика</h2>
+                <div id="stats-panel" class="space-y-4"></div>
+            </div>
+
+            <div class="bg-discord-sidebar rounded-xl p-6 border border-gray-700" id="description-section">
+                <h2 class="text-lg font-semibold mb-4">Описание</h2>
+                <div id="description-text" class="text-sm text-gray-300 whitespace-pre-wrap"></div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const voteId = {{ vote_id }};
+    let voteData = null;
+
+    async function loadVote() {
+        const userRes = await fetch('/api/auth/callback').catch(() => null);
+        const guildsRes = await fetch('/api/guilds');
+        const guilds = await guildsRes.json();
+        if (!guilds.length) return;
+
+        const guildId = guilds[0].id;
+        const res = await fetch(`/api/guilds/${guildId}/votes/${voteId}`);
+        if (!res.ok) {
+            document.getElementById('vote-title').textContent = 'Голосование не найдено';
+            return;
+        }
+
+        voteData = await res.json();
+        renderVote();
+    }
+
+    function renderVote() {
+        const v = voteData;
+        document.title = `#${v.vote_number} ${v.title} — Совет`;
+        document.getElementById('vote-title').textContent = `ГОЛОСОВАНИЕ №${v.vote_number}`;
+        document.getElementById('vote-subtitle').textContent = v.title;
+
+        const statusLabels = {
+            draft: '📝 Черновик', scheduled: '🕐 Запланировано', open: '🟢 Открыто',
+            paused: '⏸️ Приостановлено', completed: '✅ Завершено', cancelled: '❌ Отменено'
+        };
+
+        const typeLabels = {
+            standard: 'Стандартное', no_abstain: 'Без воздержания',
+            single_choice: 'Выбор варианта', multi_choice: 'Множественный'
+        };
+
+        const anonymityLabels = {
+            open: 'Открытое', anonymous_members: 'Анонимное', full: 'Полностью анонимное'
+        };
+
+        const info = document.getElementById('vote-info');
+        info.innerHTML = `
+            <div><span class="text-gray-400">Статус:</span> <span class="font-semibold">${statusLabels[v.status] || v.status}</span></div>
+            <div><span class="text-gray-400">Тип:</span> ${typeLabels[v.vote_type] || v.vote_type}</div>
+            <div><span class="text-gray-400">Режим:</span> ${anonymityLabels[v.anonymity_level] || v.anonymity_level}</div>
+            <div><span class="text-gray-400">Инициатор:</span> ${v.creator_name || '—'}</div>
+            <div><span class="text-gray-400">Обязательное:</span> ${v.is_mandatory ? 'Да' : 'Нет'}</div>
+            <div><span class="text-gray-400">Создано:</span> ${v.created_at ? new Date(v.created_at).toLocaleString('ru-RU') : '—'}</div>
+            <div><span class="text-gray-400">Начало:</span> ${v.starts_at ? new Date(v.starts_at).toLocaleString('ru-RU') : '—'}</div>
+            <div><span class="text-gray-400">Окончание:</span> ${v.ends_at ? new Date(v.ends_at).toLocaleString('ru-RU') : '—'}</div>
+        `;
+
+        if (v.status === 'open') {
+            document.getElementById('admin-actions').style.display = 'flex';
+        }
+
+        renderResults();
+        renderParticipants();
+        renderStats();
+
+        if (v.description || v.reason) {
+            document.getElementById('description-text').textContent =
+                [v.description, v.reason ? `Причина: ${v.reason}` : ''].filter(Boolean).join('\n\n');
+        } else {
+            document.getElementById('description-section').style.display = 'none';
+        }
+    }
+
+    function renderResults() {
+        const v = voteData;
+        const container = document.getElementById('results-bars');
+
+        if (!v.options || v.options.length === 0) {
+            container.innerHTML = '<p class="text-gray-400">Нет вариантов</p>';
+            return;
+        }
+
+        const total = v.options.reduce((s, o) => s + o.vote_count, 0) || 1;
+        const colors = ['bg-green-500', 'bg-red-500', 'bg-gray-400', 'bg-blue-500', 'bg-yellow-500'];
+
+        container.innerHTML = v.options.map((opt, i) => {
+            const pct = total > 0 ? (opt.vote_count / total * 100).toFixed(1) : 0;
+            return `
+                <div>
+                    <div class="flex justify-between text-sm mb-1">
+                        <span>${opt.label}</span>
+                        <span class="text-gray-400">${opt.vote_count} (${pct}%)</span>
+                    </div>
+                    <div class="w-full bg-gray-700 rounded-full h-3">
+                        <div class="${colors[i % colors.length]} h-3 rounded-full transition-all" style="width: ${pct}%"></div>
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    function renderParticipants() {
+        const v = voteData;
+        const tbody = document.getElementById('participants-body');
+        const participants = v.participants || [];
+
+        if (participants.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="3" class="py-4 text-center text-gray-400">Нет данных</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = participants.map(p => `
+            <tr class="border-t border-gray-700">
+                <td class="py-2">${p.user_name || p.user_id}</td>
+                <td class="py-2">${p.has_voted ? p.option_label : '<span class="text-gray-500">—</span>'}</td>
+                <td class="py-2 text-gray-400">${p.voted_at && p.voted_at !== 'Скрыто' ? new Date(p.voted_at).toLocaleTimeString('ru-RU') : '—'}</td>
+            </tr>
+        `).join('');
+    }
+
+    function renderStats() {
+        const v = voteData;
+        const panel = document.getElementById('stats-panel');
+        const voted = (v.participants || []).filter(p => p.has_voted).length;
+        const total = v.options ? v.options.reduce((s, o) => s + o.vote_count, 0) : 0;
+
+        panel.innerHTML = `
+            <div class="flex justify-between">
+                <span class="text-gray-400">Проголосовали</span>
+                <span class="font-semibold">${voted}</span>
+            </div>
+            <div class="flex justify-between">
+                <span class="text-gray-400">Всего голосов</span>
+                <span>${total}</span>
+            </div>
+            <div class="flex justify-between">
+                <span class="text-gray-400">Кворум</span>
+                <span class="${v.quorum_reached ? 'text-green-400' : 'text-red-400'}">
+                    ${v.quorum_reached ? 'Достигнут' : 'Не достигнут'}
+                </span>
+            </div>
+            <div class="flex justify-between">
+                <span class="text-gray-400">Итог</span>
+                <span class="font-semibold">${v.final_decision || '—'}</span>
+            </div>
+        `;
+    }
+
+    async function completeVote() {
+        if (!confirm('Завершить голосование досрочно?')) return;
+        alert('Используйте команду /complete_vote в Discord');
+    }
+
+    async function pauseVote() {
+        alert('Используйте команду /голосование приостановить в Discord');
+    }
+
+    loadVote();
+</script>
+{% endblock %}
