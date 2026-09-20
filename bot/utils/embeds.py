@@ -309,7 +309,7 @@ async def _build_council_table(session: "AsyncSession", vote: "Vote") -> str:
     lines = []
     for m in members:
         num = m.council_number
-        label = f"О4-{num}" if num is not None else "О4-?"
+        label = f"О5-{num}" if num is not None else "О5-?"
         sphere = m.sphere or _SPHERES.get(num, "")
 
         participant = votes_by_user.get(m.user_id)

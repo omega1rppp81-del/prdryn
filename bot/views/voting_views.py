@@ -273,6 +273,7 @@ class EarlyEndModal(discord.ui.Modal, title="Досрочное завершен
             )
 
             embed = None
+            targets = []
             try:
                 from sqlalchemy import select as sa_select
                 from sqlalchemy.orm import selectinload
@@ -285,6 +286,7 @@ class EarlyEndModal(discord.ui.Modal, title="Досрочное завершен
                 )
                 fresh_vote = result.scalar_one()
                 embed = await build_completed_embed(fresh_vote, session)
+                targets = await voting.get_vote_message_targets(session, vote)
             except Exception:
                 pass
 
@@ -292,14 +294,15 @@ class EarlyEndModal(discord.ui.Modal, title="Досрочное завершен
 
             await interaction.followup.send("\u2705 Голосование завершено досрочно.", ephemeral=True)
 
-            try:
-                if embed and vote.message_id and vote.channel_id:
-                    channel = interaction.client.get_channel(vote.channel_id)
-                    if channel:
-                        msg = await channel.fetch_message(vote.message_id)
-                        await msg.edit(embed=embed, view=None)
-            except Exception:
-                pass
+            if embed:
+                for ch_id, msg_id in targets:
+                    try:
+                        channel = interaction.client.get_channel(ch_id)
+                        if channel:
+                            msg = await channel.fetch_message(msg_id)
+                            await msg.edit(embed=embed, view=None)
+                    except Exception:
+                        continue
 
 
 class ExtendModal(discord.ui.Modal, title="Продление голосования"):

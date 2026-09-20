@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import logging
 import re
+import unicodedata
 from typing import Any
 
 import discord
@@ -301,7 +302,39 @@ class CreateVoteSetupView(discord.ui.View):
                 if fresh_settings.council_role_id:
                     role_ping = f"<@&{fresh_settings.council_role_id}>"
 
-        msg = await channel.send(content=role_ping, embed=embed, view=view)
+        target_channels = []
+        if channel:
+            target_channels.append(channel)
+        for cid in (settings_obj.extra_vote_channel_ids or []):
+            ch = interaction.client.get_channel(cid)
+            if ch and all(ch.id != c.id for c in target_channels):
+                target_channels.append(ch)
+
+        primary_message = None
+        for idx, ch in enumerate(target_channels):
+            is_primary = idx == 0
+            ch_guild_id = getattr(getattr(ch, "guild", None), "id", interaction.guild_id)
+            content = role_ping if ch_guild_id == interaction.guild_id else None
+            msg = await ch.send(
+                content=content,
+                embed=embed,
+                view=view if is_primary else None,
+            )
+            if primary_message is None:
+                primary_message = msg
+
+            async with get_session() as copy_session:
+                from bot.models.models import VoteMessage
+
+                copy_session.add(VoteMessage(
+                    vote_id=vote.id,
+                    guild_id=ch_guild_id,
+                    channel_id=ch.id,
+                    message_id=msg.id,
+                ))
+                await copy_session.commit()
+
+        msg = primary_message
 
         try:
             thread_name = f"Обсуждение голосования #{vote.vote_number}"
@@ -316,14 +349,15 @@ class CreateVoteSetupView(discord.ui.View):
             vote_msg = await voting.get_vote_by_id(session, vote.id)
             if vote_msg:
                 vote_msg.message_id = msg.id
-                vote_msg.channel_id = channel.id
+                vote_msg.channel_id = msg.channel.id
                 await session.commit()
 
         for child in self.children:
             child.disabled = True
 
+        channel_list = ", ".join(c.mention for c in target_channels)
         await interaction.followup.send(
-            f"\u2705 Голосование **{self.title_text}** создано и опубликовано в {channel.mention}.\n"
+            f"\u2705 Голосование **{self.title_text}** создано и опубликовано в {channel_list}.\n"
             f"[Перейти к сообщению]({msg.jump_url})",
             ephemeral=True,
         )
@@ -467,21 +501,22 @@ async def cancel_vote_command(interaction: discord.Interaction, vote_id: int, re
             details={"reason": reason},
         )
 
+        targets = await voting.get_vote_message_targets(session, vote)
         await session.commit()
 
-    if vote.message_id and vote.channel_id:
-        try:
-            channel = bot.get_channel(vote.channel_id)
-            if channel:
-                msg = await channel.fetch_message(vote.message_id)
-                embed = discord.Embed(
-                    title=f"\u274c ГОСОВАНИЕ #{vote.vote_number} ОТМЕНЕНО",
-                    description=f"**Причина:** {reason}",
-                    color=0xED4245,
-                )
-                await msg.edit(embed=embed, view=None)
-        except Exception:
-            pass
+    for ch_id, msg_id in targets:
+            try:
+                channel = bot.get_channel(ch_id)
+                if channel:
+                    msg = await channel.fetch_message(msg_id)
+                    embed = discord.Embed(
+                        title=f"\u274c ГОСОВАНИЕ #{vote.vote_number} ОТМЕНЕНО",
+                        description=f"**Причина:** {reason}",
+                        color=0xED4245,
+                    )
+                    await msg.edit(embed=embed, view=None)
+            except Exception:
+                pass
 
     await interaction.followup.send("\u2705 Голосование отменено.", ephemeral=True)
 
@@ -535,16 +570,18 @@ async def complete_vote_command(interaction: discord.Interaction, vote_id: int, 
             except Exception:
                 pass
 
+        targets = await voting.get_vote_message_targets(session, vote)
         await session.commit()
 
-        if embed and vote.message_id and vote.channel_id:
-            try:
-                channel = bot.get_channel(vote.channel_id)
-                if channel:
-                    msg = await channel.fetch_message(vote.message_id)
-                    await msg.edit(embed=embed, view=None)
-            except Exception:
-                pass
+        if embed:
+            for ch_id, msg_id in targets:
+                try:
+                    channel = bot.get_channel(ch_id)
+                    if channel:
+                        msg = await channel.fetch_message(msg_id)
+                        await msg.edit(embed=embed, view=None)
+                except Exception:
+                    pass
 
     await interaction.followup.send("\u2705 Голосование завершено.", ephemeral=True)
 
@@ -573,11 +610,10 @@ async def sync_members_command(interaction: discord.Interaction):
             return
 
         members_data = []
-        for member in role.members:
+        async for member in _iter_role_members(guild, role):
             if member.bot:
                 continue
             council_num = _parse_council_number(member.display_name)
-            sphere = _SPHERES.get(council_num) if council_num is not None else None
 
             veto_level = None
             if council_num is not None:
@@ -602,7 +638,6 @@ async def sync_members_command(interaction: discord.Interaction):
                 "role_id": role.id,
                 "weight": 1.0,
                 "council_number": council_num,
-                "sphere": sphere,
                 "veto_level": veto_level,
             })
 
@@ -622,6 +657,7 @@ async def sync_members_command(interaction: discord.Interaction):
     council_role="Роль Совета",
     admin_role="Роль администраторов",
     chair_role="Роль председателя (для ВЕТО II уровня)",
+    extra_vote_channels="Дополнительные каналы для дублирования (через запятую)",
     timezone="Часовой пояс",
 )
 async def configure_command(
@@ -631,6 +667,7 @@ async def configure_command(
     council_role: discord.Role | None = None,
     admin_role: discord.Role | None = None,
     chair_role: discord.Role | None = None,
+    extra_vote_channels: str | None = None,
     timezone: str | None = None,
 ):
     if not await _check_admin_permission(interaction):
@@ -657,6 +694,22 @@ async def configure_command(
         if chair_role:
             settings_obj.chair_role_id = chair_role.id
             changes["chair_role"] = chair_role.mention
+        if extra_vote_channels is not None and extra_vote_channels.strip():
+            parsed_ids = []
+            for part in extra_vote_channels.split(","):
+                cid = _resolve_channel_id(interaction, part)
+                if cid is None:
+                    continue
+                ch = interaction.client.get_channel(cid)
+                if ch and getattr(ch, "send", None) and cid not in parsed_ids:
+                    parsed_ids.append(cid)
+            if vote_channel:
+                parsed_ids = [cid for cid in parsed_ids if cid != vote_channel.id]
+            elif settings_obj.vote_channel_id:
+                parsed_ids = [cid for cid in parsed_ids if cid != settings_obj.vote_channel_id]
+            settings_obj.extra_vote_channel_ids = parsed_ids
+            mentions = ", ".join(_channel_label(interaction, cid) for cid in parsed_ids) or "—"
+            changes["extra_vote_channels"] = mentions
         if timezone:
             settings_obj.timezone = timezone
             changes["timezone"] = timezone
@@ -665,6 +718,7 @@ async def configure_command(
             await interaction.followup.send(
                 "\u2139\ufe0f Текущие настройки:\n"
                 f"Канал голосований: <#{settings_obj.vote_channel_id}>\n"
+                f"Доп. каналы (дублирование): {', '.join(_channel_label(interaction, cid) for cid in (settings_obj.extra_vote_channel_ids or [])) or '—'}\n"
                 f"Канал журнала: <#{settings_obj.log_channel_id}>\n"
                 f"Роль Совета: <@&{settings_obj.council_role_id}>\n"
                 f"Роль администраторов: <@&{settings_obj.admin_role_id}>\n"
@@ -1147,7 +1201,7 @@ async def vote_veto_command(
         council_num = _parse_council_number(interaction.user.display_name)
         if council_num is None:
             await interaction.followup.send(
-                "\u274c Вы не член Совета (нет О4-X в нике).", ephemeral=True
+                "\u274c Вы не член Совета (нет О5-X в нике).", ephemeral=True
             )
             return
 
@@ -1207,16 +1261,18 @@ async def vote_veto_command(
             except Exception:
                 pass
 
+        targets = await voting.get_vote_message_targets(session, vote)
         await session.commit()
 
-    if embed and vote.message_id and vote.channel_id:
-        try:
-            channel = interaction.client.get_channel(vote.channel_id)
-            if channel:
-                msg = await channel.fetch_message(vote.message_id)
-                await msg.edit(embed=embed, view=None)
-        except Exception:
-            pass
+    if embed:
+        for ch_id, msg_id in targets:
+            try:
+                channel = interaction.client.get_channel(ch_id)
+                if channel:
+                    msg = await channel.fetch_message(msg_id)
+                    await msg.edit(embed=embed, view=None)
+            except Exception:
+                pass
 
     await interaction.followup.send(
         f"\u2705 Вето **{roman}** уровня наложено на голосование #{vote.vote_number}\n"
@@ -1493,7 +1549,7 @@ async def help_command(interaction: discord.Interaction):
     p1 = discord.Embed(
         title="Система голосований Совета",
         description=(
-            "Бот для проведения голосований среди членов Совета О4.\n"
+            "Бот для проведения голосований среди членов Совета О5.\n"
             "Создавайте голосования, публикуйте их в канале,\n"
             "участники голосуют кнопками, результаты подсчитываются\n"
             "автоматически.\n\n"
@@ -1508,7 +1564,7 @@ async def help_command(interaction: discord.Interaction):
             "→ бот завершает и показывает результаты\n\n"
             "**Право ВЕТО:**\n"
             "3 уровня приоритета: I (высший) > II > III.\n"
-            "I — О4-0 или роль председателя, II — О4-1, III — О4-13.\n"
+            "I — О5-0 или роль председателя, II — О5-1, III — О5-13.\n"
             "Вето более высокого уровня перекрывает низший."
         ),
         color=0x5865F2,
@@ -1952,29 +2008,68 @@ async def _handle_button_vote(interaction: discord.Interaction, vote_id: int, op
             pass
 
 
-_SPHERES = {
-    0: "Куратор",
-    1: "Председатель",
-    2: "Безопасность",
-    3: "Исследования",
-    4: "Обслуживание",
-    5: "Правосудие",
-    6: "Стратегия",
-    7: "Администрация",
-    8: "Медицина",
-    9: "Внутр. безопасность",
-    10: "Информация",
-    11: "Разведка",
-    12: "Реагирование",
-    13: "Этика",
+_ROMAN_TO_INT = {
+    "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7,
+    "VIII": 8, "IX": 9, "X": 10, "XI": 11, "XII": 12, "XIII": 13,
 }
+
+_COUNCIL_NUMBER_RE = re.compile(
+    r"[OoОо][\s\-_–—:.．·]*\d+[\s\-_–—:.．·]+[OoОо]?[\s\-_–—:.．·]*"
+    r"(\d{1,3}|X{0,2}I{0,3}|IX|IV|V?I{1,3})"
+)
 
 
 def _parse_council_number(display_name: str) -> int | None:
-    match = re.search(r"[OoОо]-?4-(\d+)", display_name)
-    if match:
-        return int(match.group(1))
-    return None
+    if not display_name:
+        return None
+    name = unicodedata.normalize("NFKC", display_name)
+    name = (
+        name.replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2212", "-")
+        .replace("\u2015", "-")
+    )
+    m = _COUNCIL_NUMBER_RE.search(name)
+    if not m:
+        return None
+    token = m.group(1)
+    if token.isdigit():
+        return int(token)
+    return _ROMAN_TO_INT.get(token.upper())
+
+
+async def _iter_role_members(guild: discord.Guild, role: discord.Role):
+    try:
+        members = await guild.fetch_members(limit=None)
+    except (discord.Forbidden, discord.HTTPException):
+        members = role.members
+    for member in members:
+        if role in member.roles:
+            yield member
+
+
+def _channel_label(interaction: discord.Interaction, cid: int) -> str:
+    ch = interaction.client.get_channel(cid)
+    if ch is None:
+        return f"`{cid}`"
+    guild = getattr(ch, "guild", None)
+    if guild and guild.id == interaction.guild_id:
+        return ch.mention
+    gname = guild.name if guild else "?"
+    return f"{ch.mention} ({gname})"
+
+
+def _resolve_channel_id(interaction: discord.Interaction, part: str) -> int | None:
+    part = part.strip()
+    if not part:
+        return None
+    m = re.search(r"<#(\d+)>", part)
+    if m:
+        return int(m.group(1))
+    try:
+        return int(part)
+    except ValueError:
+        return None
 
 
 async def _check_admin_permission(interaction: discord.Interaction, silent: bool = False) -> bool:
@@ -2041,22 +2136,28 @@ async def auto_close_task() -> None:
                     user_name="Система",
                 )
 
-                if vote.message_id and vote.channel_id:
-                    try:
-                        channel = bot.get_channel(vote.channel_id)
-                        if channel:
-                            result2 = await session.execute(
-                                sa_select(VoteModel)
-                                .where(VoteModel.id == vote.id)
-                                .options(selectinload(VoteModel.options), selectinload(VoteModel.participants))
-                            )
-                            fresh_vote = result2.scalar_one()
-                            from bot.utils.embeds import build_completed_embed
-                            msg = await channel.fetch_message(vote.message_id)
-                            embed = await build_completed_embed(fresh_vote, session)
-                            await msg.edit(embed=embed, view=None)
-                    except Exception as e:
-                        logger.warning("Не удалось обновить сообщение %s: %s", vote.message_id, e)
+                try:
+                    if not (vote.message_id and vote.channel_id):
+                        continue
+                    result2 = await session.execute(
+                        sa_select(VoteModel)
+                        .where(VoteModel.id == vote.id)
+                        .options(selectinload(VoteModel.options), selectinload(VoteModel.participants))
+                    )
+                    fresh_vote = result2.scalar_one()
+                    from bot.utils.embeds import build_completed_embed
+                    embed = await build_completed_embed(fresh_vote, session)
+                    targets = await voting.get_vote_message_targets(session, vote)
+                    for ch_id, msg_id in targets:
+                        try:
+                            channel = bot.get_channel(ch_id)
+                            if channel:
+                                msg = await channel.fetch_message(msg_id)
+                                await msg.edit(embed=embed, view=None)
+                        except Exception as e:
+                            logger.warning("Не удалось обновить сообщение %s: %s", msg_id, e)
+                except Exception as e:
+                    logger.warning("Не удалось обновить сообщение %s: %s", vote.message_id, e)
 
             await session.commit()
     except Exception as e:
@@ -2086,11 +2187,10 @@ async def auto_sync_council_task() -> None:
                 continue
 
             members_data = []
-            for member in role.members:
+            async for member in _iter_role_members(guild, role):
                 if member.bot:
                     continue
                 council_num = _parse_council_number(member.display_name)
-                sphere = _SPHERES.get(council_num) if council_num is not None else None
 
                 veto_level = None
                 if council_num is not None:
@@ -2115,7 +2215,6 @@ async def auto_sync_council_task() -> None:
                     "role_id": role.id,
                     "weight": 1.0,
                     "council_number": council_num,
-                    "sphere": sphere,
                     "veto_level": veto_level,
                 })
 
@@ -2244,6 +2343,8 @@ async def main() -> None:
     )
 
     init_db()
+
+    audit.set_client(bot)
 
     async with bot:
         await bot.start(settings.discord.token)

@@ -183,6 +183,7 @@ async def api_guild_settings(guild_id: int, user: dict = Depends(get_current_use
         return {
             "guild_id": gs.guild_id,
             "vote_channel_id": gs.vote_channel_id,
+            "extra_vote_channel_ids": gs.extra_vote_channel_ids,
             "log_channel_id": gs.log_channel_id,
             "council_role_id": gs.council_role_id,
             "admin_role_id": gs.admin_role_id,

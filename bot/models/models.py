@@ -55,6 +55,7 @@ class GuildSettings(Base, TimestampMixin):
     guild_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False, index=True)
 
     vote_channel_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    extra_vote_channel_ids: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     log_channel_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     admin_channel_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
@@ -223,6 +224,32 @@ class Vote(Base, TimestampMixin):
         back_populates="vote",
         cascade="all, delete-orphan",
     )
+    message_copies: Mapped[list["VoteMessage"]] = relationship(
+        back_populates="vote",
+        cascade="all, delete-orphan",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Published vote message copies (multi-channel support)
+# ---------------------------------------------------------------------------
+
+
+class VoteMessage(Base, TimestampMixin):
+    __tablename__ = "vote_messages"
+    __table_args__ = (
+        UniqueConstraint("message_id", name="uq_vote_message_copies"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vote_id: Mapped[int] = mapped_column(
+        ForeignKey("votes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    channel_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
+
+    vote: Mapped["Vote"] = relationship(back_populates="message_copies")
 
 
 # ---------------------------------------------------------------------------

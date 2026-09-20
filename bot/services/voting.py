@@ -89,6 +89,26 @@ async def get_vote_by_message(session: AsyncSession, message_id: int) -> Vote | 
     return result.scalar_one_or_none()
 
 
+async def get_vote_message_targets(
+    session: AsyncSession, vote: Vote
+) -> list[tuple[int, int]]:
+    """Return (channel_id, message_id) pairs for every published copy of a vote."""
+    from bot.models.models import VoteMessage
+
+    pairs = set()
+    if vote.message_id and vote.channel_id:
+        pairs.add((vote.channel_id, vote.message_id))
+
+    result = await session.execute(
+        select(VoteMessage).where(VoteMessage.vote_id == vote.id)
+    )
+    for copy in result.scalars().all():
+        if copy.channel_id and copy.message_id:
+            pairs.add((copy.channel_id, copy.message_id))
+
+    return list(pairs)
+
+
 async def get_next_vote_number(session: AsyncSession, guild_id: int) -> int:
     settings_obj = await get_or_create_guild_settings(session, guild_id)
     num = settings_obj.next_vote_number
