@@ -106,7 +106,6 @@ class CouncilMember(Base, TimestampMixin):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     weight: Mapped[float] = mapped_column(Float, default=1.0)
     council_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    sphere: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     veto_level: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     participations: Mapped[list["VoteParticipant"]] = relationship(

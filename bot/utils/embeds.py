@@ -16,23 +16,6 @@ from sqlalchemy import func as sa_func
 # Constants
 # ---------------------------------------------------------------------------
 
-_SPHERES = {
-    0: "Куратор",
-    1: "Председатель",
-    2: "Безопасность",
-    3: "Исследования",
-    4: "Обслуживание",
-    5: "Правосудие",
-    6: "Стратегия",
-    7: "Администрация",
-    8: "Медицина",
-    9: "Внутр. безопасность",
-    10: "Информация",
-    11: "Разведка",
-    12: "Реагирование",
-    13: "Этика",
-}
-
 _STATUS_SYMBOL = {
     "draft": "✎",
     "scheduled": "◷",
@@ -310,7 +293,6 @@ async def _build_council_table(session: "AsyncSession", vote: "Vote") -> str:
     for m in members:
         num = m.council_number
         label = f"О5-{num}" if num is not None else "О5-?"
-        sphere = m.sphere or _SPHERES.get(num, "")
 
         participant = votes_by_user.get(m.user_id)
         if participant and participant.option_id:
@@ -324,15 +306,9 @@ async def _build_council_table(session: "AsyncSession", vote: "Vote") -> str:
             c = _A[ck]
             sv = _VOTE_SYM.get(vl, "·")
 
-            if sphere:
-                lines.append(f"  {label:<8} {sphere:<18} {c}{sv}  {vl}\x1b[0m")
-            else:
-                lines.append(f"  {label:<8} {c}{sv}  {vl}\x1b[0m")
+            lines.append(f"  {label:<8} {c}{sv}  {vl}\x1b[0m")
         else:
-            if sphere:
-                lines.append(f"  {label:<8} {sphere:<18} \x1b[90m·  не голосовал\x1b[0m")
-            else:
-                lines.append(f"  {label:<8} \x1b[90m·  не голосовал\x1b[0m")
+            lines.append(f"  {label:<8} \x1b[90m·  не голосовал\x1b[0m")
 
     return "\n".join(lines)
 

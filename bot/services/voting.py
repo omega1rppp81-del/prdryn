@@ -535,7 +535,6 @@ async def sync_council_members(session: AsyncSession, guild_id: int, members: li
             existing.role_id = m.get("role_id")
             existing.weight = m.get("weight", 1.0)
             existing.council_number = m.get("council_number")
-            existing.sphere = m.get("sphere")
             existing.veto_level = m.get("veto_level")
         else:
             member = CouncilMember(
@@ -545,7 +544,6 @@ async def sync_council_members(session: AsyncSession, guild_id: int, members: li
                 role_id=m.get("role_id"),
                 weight=m.get("weight", 1.0),
                 council_number=m.get("council_number"),
-                sphere=m.get("sphere"),
                 veto_level=m.get("veto_level"),
                 is_active=True,
             )
