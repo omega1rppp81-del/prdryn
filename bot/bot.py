@@ -2040,12 +2040,13 @@ def _parse_council_number(display_name: str) -> int | None:
 
 async def _iter_role_members(guild: discord.Guild, role: discord.Role):
     try:
-        members = await guild.fetch_members(limit=None)
+        async for member in guild.fetch_members(limit=None):
+            if role in member.roles:
+                yield member
     except (discord.Forbidden, discord.HTTPException):
-        members = role.members
-    for member in members:
-        if role in member.roles:
-            yield member
+        for member in role.members:
+            if role in member.roles:
+                yield member
 
 
 def _channel_label(interaction: discord.Interaction, cid: int) -> str:
@@ -2274,13 +2275,24 @@ async def reminder_task() -> None:
                         continue
 
                     try:
-                        members_result = await session.execute(
-                            sa_select(CouncilMemberModel).where(
-                                CouncilMemberModel.guild_id == gs.guild_id,
-                                CouncilMemberModel.is_active == True,
+                        if vote.is_mandatory:
+                            from bot.models.models import VoteMandatoryMember as VoteMandatoryMemberModel
+
+                            mm_result = await session.execute(
+                                sa_select(VoteMandatoryMemberModel).where(
+                                    VoteMandatoryMemberModel.vote_id == vote.id,
+                                    VoteMandatoryMemberModel.is_exempt == False,
+                                )
                             )
-                        )
-                        all_members = list(members_result.scalars().all())
+                            all_members = list(mm_result.scalars().all())
+                        else:
+                            members_result = await session.execute(
+                                sa_select(CouncilMemberModel).where(
+                                    CouncilMemberModel.guild_id == gs.guild_id,
+                                    CouncilMemberModel.is_active == True,
+                                )
+                            )
+                            all_members = list(members_result.scalars().all())
 
                         participants_result = await session.execute(
                             sa_select(VoteParticipantModel).where(
@@ -2304,15 +2316,19 @@ async def reminder_task() -> None:
                             try:
                                 user = await bot.fetch_user(uid)
                                 dm = await user.create_dm()
+                                if vote.is_mandatory:
+                                    head = "\u26a0\ufe0f **ОБЯЗАТЕЛЬНОЕ голосование:**"
+                                else:
+                                    head = "\u23f0 **Напоминание:**"
                                 if reason_tag == "halfway":
                                     await dm.send(
-                                        f"\u23f0 **Напоминание:** Голосование **#{vote.vote_number}** "
+                                        f"{head} Голосование **#{vote.vote_number}** "
                                         f"на полпути. Осталось {remaining}. "
                                         f"Проголосуйте!"
                                     )
                                 else:
                                     await dm.send(
-                                        f"\u23f0 **Напоминание:** Голосование **#{vote.vote_number}** "
+                                        f"{head} Голосование **#{vote.vote_number}** "
                                         f"завершается {remaining}. "
                                         f"Проголосуйте!"
                                     )

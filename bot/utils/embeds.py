@@ -10,8 +10,6 @@ if TYPE_CHECKING:
 
     from bot.models import Vote
 
-from sqlalchemy import func as sa_func
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -142,17 +140,9 @@ async def build_vote_embed(vote: "Vote", show_results: bool = True, session: "As
         voted_count = len([p for p in (vote.participants or []) if p.has_voted])
         total_eligible = 0
         if session is not None:
-            from sqlalchemy import select as sa_select
-            from bot.models import CouncilMember
-            member_result = await session.execute(
-                sa_select(sa_func.count(CouncilMember.id)).where(
-                    CouncilMember.guild_id == vote.guild_id,
-                    CouncilMember.is_active == True,
-                )
-            )
-            total_eligible = member_result.scalar() or 0
-        if total_eligible == 0:
-            total_eligible = voted_count
+            from bot.services.voting import count_eligible_voters
+
+            total_eligible = await count_eligible_voters(session, vote)
         embed.add_field(
             name="── Проголосовало ──",
             value=f"```ansi\n  \x1b[32m{voted_count}\x1b[0m из {total_eligible} участников\n```",
@@ -163,7 +153,7 @@ async def build_vote_embed(vote: "Vote", show_results: bool = True, session: "As
     meta_parts = []
     if vote.ends_at:
         meta_parts.append(f"**Срок:** {discord.utils.format_dt(vote.ends_at, 'f')} ({discord.utils.format_dt(vote.ends_at, 'R')})")
-    if vote.anonymity_level == "open":
+    if vote.anonymity_level != "full":
         meta_parts.append(f"**Автор:** <@{vote.creator_id}>")
     else:
         meta_parts.append("**Автор:** Скрыт")
@@ -239,7 +229,7 @@ async def build_completed_embed(vote: "Vote", session: "AsyncSession | None" = N
         )
 
     # ── Council table (ANSI) ──
-    if session is not None:
+    if vote.anonymity_level == "open" and session is not None:
         table = await _build_council_table(session, vote)
         if table:
             embed.add_field(
@@ -248,9 +238,35 @@ async def build_completed_embed(vote: "Vote", session: "AsyncSession | None" = N
                 inline=False,
             )
 
+    # ── Mandatory members who did not vote ──
+    if vote.is_mandatory and vote.anonymity_level == "open" and session is not None:
+        from sqlalchemy import select as sa_select
+
+        from bot.models import VoteMandatoryMember
+
+        pend_result = await session.execute(
+            sa_select(VoteMandatoryMember)
+            .where(
+                VoteMandatoryMember.vote_id == vote.id,
+                VoteMandatoryMember.has_voted == False,
+                VoteMandatoryMember.is_exempt == False,
+            )
+            .order_by(VoteMandatoryMember.user_name.asc())
+        )
+        pending = list(pend_result.scalars().all())
+        if pending:
+            names = ", ".join(m.user_name or f"<@{m.user_id}>" for m in pending[:25])
+            if len(pending) > 25:
+                names += f" и ещё {len(pending) - 25}"
+            embed.add_field(
+                name=f"── Не выполнили обязательное ({len(pending)}) ──",
+                value=names,
+                inline=False,
+            )
+
     # ── Author + timestamp (normal text) ──
     meta_parts = []
-    if vote.anonymity_level == "open":
+    if vote.anonymity_level != "full":
         meta_parts.append(f"**Автор:** <@{vote.creator_id}>")
     if vote.actual_end_at:
         meta_parts.append(f"**Завершено:** {discord.utils.format_dt(vote.actual_end_at, 'f')}")

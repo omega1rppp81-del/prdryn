@@ -8,7 +8,7 @@ import discord
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.models import AuditAction, AuditLog
+from bot.models import AuditAction, AuditLog, Vote
 from bot.models.models import GuildSettings
 
 logger = logging.getLogger(__name__)
@@ -71,15 +71,21 @@ async def _send_log_message(session: AsyncSession, entry: AuditLog) -> None:
         meta = _ACTION_META.get(entry.action, (f"\u2139\ufe0f {entry.action}", 0x5865F2))
         title, color = meta
 
+        anonymize = False
+        if entry.vote_id:
+            vote = await session.get(Vote, entry.vote_id)
+            anonymize = bool(vote and vote.anonymity_level == "full")
+
         embed = discord.Embed(title=title, color=color)
         desc_parts = []
-        if entry.user_name:
-            desc_parts.append(f"Пользователь: **{entry.user_name}**")
+        if not anonymize:
+            if entry.user_name:
+                desc_parts.append(f"Пользователь: **{entry.user_name}**")
+            details_text = _format_details(entry.details)
+            if details_text:
+                desc_parts.append(details_text)
         if entry.vote_id:
             desc_parts.append(f"Голосование ID: `{entry.vote_id}`")
-        details_text = _format_details(entry.details)
-        if details_text:
-            desc_parts.append(details_text)
         embed.description = "\n".join(desc_parts) or "—"
         embed.timestamp = dt.datetime.utcnow()
 

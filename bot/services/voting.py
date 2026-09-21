@@ -208,6 +208,30 @@ async def open_vote(session: AsyncSession, vote: Vote) -> Vote:
         settings_obj = await get_or_create_guild_settings(session, vote.guild_id)
         vote.guild_settings_id = settings_obj.id
 
+    if vote.is_mandatory and vote.guild_id:
+        members_result = await session.execute(
+            select(CouncilMember).where(
+                CouncilMember.guild_id == vote.guild_id,
+                CouncilMember.is_active == True,
+            )
+        )
+        active = list(members_result.scalars().all())
+
+        existing_result = await session.execute(
+            select(VoteMandatoryMember).where(VoteMandatoryMember.vote_id == vote.id)
+        )
+        existing_users = {mm.user_id for mm in existing_result.scalars().all()}
+
+        for m in active:
+            if m.user_id in existing_users:
+                continue
+            session.add(VoteMandatoryMember(
+                vote_id=vote.id,
+                user_id=m.user_id,
+                user_name=m.display_name,
+                has_voted=False,
+            ))
+
     await session.flush()
     return vote
 
@@ -289,6 +313,17 @@ async def cast_vote(
 
     await session.flush()
 
+    if vote.is_mandatory:
+        mm_result = await session.execute(
+            select(VoteMandatoryMember).where(
+                VoteMandatoryMember.vote_id == vote.id,
+                VoteMandatoryMember.user_id == user_id,
+            )
+        )
+        mm = mm_result.scalar_one_or_none()
+        if mm:
+            mm.has_voted = True
+
     if is_new_vote and vote.guild_id:
         try:
             await update_user_stats(
@@ -320,6 +355,26 @@ async def revoke_vote(session: AsyncSession, vote: Vote, user_id: int) -> VotePa
     return participant
 
 
+async def count_eligible_voters(session: AsyncSession, vote: Vote) -> int:
+    if vote.is_mandatory:
+        mandatory_result = await session.execute(
+            select(func.count(VoteMandatoryMember.id)).where(
+                VoteMandatoryMember.vote_id == vote.id,
+                VoteMandatoryMember.is_exempt == False,
+            )
+        )
+        count = mandatory_result.scalar() or 0
+        if count > 0:
+            return count
+    member_result = await session.execute(
+        select(func.count(CouncilMember.id)).where(
+            CouncilMember.guild_id == vote.guild_id,
+            CouncilMember.is_active == True,
+        )
+    )
+    return member_result.scalar() or 0
+
+
 async def calculate_results(session: AsyncSession, vote: Vote) -> dict:
     options_result = await session.execute(
         select(VoteOption).where(VoteOption.vote_id == vote.id).order_by(VoteOption.position)
@@ -336,26 +391,7 @@ async def calculate_results(session: AsyncSession, vote: Vote) -> dict:
 
     total_voted = len(participants)
 
-    total_eligible = 0
-    if vote.is_mandatory:
-        mandatory_result = await session.execute(
-            select(func.count(VoteMandatoryMember.id)).where(
-                VoteMandatoryMember.vote_id == vote.id,
-                VoteMandatoryMember.is_exempt == False,
-            )
-        )
-        total_eligible = mandatory_result.scalar() or 0
-    else:
-        member_result = await session.execute(
-            select(func.count(CouncilMember.id)).where(
-                CouncilMember.guild_id == vote.guild_id,
-                CouncilMember.is_active == True,
-            )
-        )
-        total_eligible = member_result.scalar() or 0
-
-    if total_eligible == 0:
-        total_eligible = total_voted
+    total_eligible = await count_eligible_voters(session, vote)
 
     turnout = (total_voted / total_eligible * 100) if total_eligible > 0 else 0
 
@@ -489,13 +525,16 @@ async def get_vote_participants_info(session: AsyncSession, vote: Vote) -> dict:
     )
     mandatory = list(mandatory_result.scalars().all())
 
-    all_result = await session.execute(
-        select(CouncilMember).where(
-            CouncilMember.guild_id == vote.guild_id,
-            CouncilMember.is_active == True,
+    if vote.is_mandatory:
+        all_members: list = mandatory
+    else:
+        all_result = await session.execute(
+            select(CouncilMember).where(
+                CouncilMember.guild_id == vote.guild_id,
+                CouncilMember.is_active == True,
+            )
         )
-    )
-    all_members = list(all_result.scalars().all())
+        all_members = list(all_result.scalars().all())
 
     voted_result = await session.execute(
         select(VoteParticipant).where(
