@@ -39,8 +39,13 @@ async def on_ready() -> None:
     init_db()
 
     try:
+        for guild in bot.guilds:
+            try:
+                await bot.tree.sync(guild=guild)
+            except Exception:
+                continue
         synced = await bot.tree.sync()
-        logger.info("Синхронизировано %d команд", len(synced))
+        logger.info("Синхронизировано команд: %d глобальных", len(synced))
     except Exception as e:
         logger.error("Ошибка синхронизации команд: %s", e)
 
@@ -64,7 +69,7 @@ async def on_resumed() -> None:
 
 @bot.tree.command(name="create_vote", description="Создать новое голосование (откроется форма)")
 async def create_vote_command(interaction: discord.Interaction):
-    if not await _check_admin_permission(interaction):
+    if not await _check_council_or_admin_permission(interaction):
         return
     modal = CreateVoteModal()
     await interaction.response.send_modal(modal)
@@ -1092,7 +1097,7 @@ async def template_list_command(interaction: discord.Interaction):
 @bot.tree.command(name="template_use", description="Создать голосование из шаблона")
 @app_commands.describe(template_id="ID шаблона", title="Название голосования")
 async def template_use_command(interaction: discord.Interaction, template_id: int, title: str):
-    if not await _check_admin_permission(interaction):
+    if not await _check_council_or_admin_permission(interaction):
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -2102,6 +2107,28 @@ async def _check_admin_permission(interaction: discord.Interaction, silent: bool
             ephemeral=True,
         )
     return False
+
+
+async def _check_council_or_admin_permission(
+    interaction: discord.Interaction, silent: bool = False
+) -> bool:
+    if interaction.guild is None:
+        if not silent:
+            await interaction.response.send_message(
+                "\u274c Эта команда доступна только на сервере.",
+                ephemeral=True,
+            )
+        return False
+
+    async with get_session() as session:
+        settings_obj = await voting.get_or_create_guild_settings(session, interaction.guild_id)
+
+    if settings_obj.council_role_id:
+        role = interaction.guild.get_role(settings_obj.council_role_id)
+        if role and role in interaction.user.roles:
+            return True
+
+    return await _check_admin_permission(interaction, silent=silent)
 
 
 @tasks.loop(minutes=1)
