@@ -188,6 +188,7 @@ class Vote(Base, TimestampMixin):
     custom_options: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     max_multi_choices: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     weights: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    memento: Mapped[bool] = mapped_column(Boolean, default=False)
 
     cancel_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     completion_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

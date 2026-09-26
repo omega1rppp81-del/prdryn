@@ -310,10 +310,11 @@ class CreateVoteSetupView(discord.ui.View):
         target_channels = []
         if channel:
             target_channels.append(channel)
-        for cid in (settings_obj.extra_vote_channel_ids or []):
-            ch = interaction.client.get_channel(cid)
-            if ch and all(ch.id != c.id for c in target_channels):
-                target_channels.append(ch)
+        if not vote.memento:
+            for cid in (settings_obj.extra_vote_channel_ids or []):
+                ch = interaction.client.get_channel(cid)
+                if ch and all(ch.id != c.id for c in target_channels):
+                    target_channels.append(ch)
 
         primary_message = None
         for idx, ch in enumerate(target_channels):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from typing import Optional
 
 from sqlalchemy import func, select, update
@@ -145,6 +146,11 @@ async def create_vote(
 ) -> Vote:
     vote_number = await get_next_vote_number(session, guild_id)
 
+    memento = False
+    if additional_info and "MEMENTO" in additional_info.upper():
+        memento = True
+        additional_info = re.sub(r"MEMENTO", "", additional_info, flags=re.IGNORECASE).strip()
+
     vote = Vote(
         vote_number=vote_number,
         guild_id=guild_id,
@@ -160,6 +166,7 @@ async def create_vote(
         anonymity_level=anonymity_level,
         change_mode=change_mode,
         is_mandatory=is_mandatory,
+        memento=memento,
         quorum_rule=quorum_rule,
         quorum_value=quorum_value,
         majority_rule=majority_rule,
