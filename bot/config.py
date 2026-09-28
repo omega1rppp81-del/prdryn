@@ -36,6 +36,7 @@ class Settings:
     log_level: str = field(default_factory=lambda: _get("LOG_LEVEL", "INFO"))
     timezone: str = field(default_factory=lambda: _get("TZ", "Europe/Moscow"))
     secret_key: str = field(default_factory=lambda: secrets.token_hex(32))
+    bot_admin_code: str = field(default_factory=lambda: _get("BOT_ADMIN_CODE"))
 
 
 settings = Settings()

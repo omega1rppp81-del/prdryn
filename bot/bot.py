@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import logging
 import re
+import time
 import unicodedata
 from typing import Any
 
@@ -1919,6 +1920,9 @@ async def vote_resume_command(interaction: discord.Interaction, vote_id: int):
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction) -> None:
+    if not await _component_allowed(interaction):
+        return
+
     if interaction.type != discord.InteractionType.component:
         return
 
@@ -2378,6 +2382,207 @@ async def reminder_task() -> None:
             await session.commit()
     except Exception as e:
         logger.error("Ошибка в reminder_task: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Изоляция сервера и панель администратора бота (/a-panel)
+# ---------------------------------------------------------------------------
+
+_ISOLATION_CACHE_TTL = 5.0
+_isolation_cache: dict[int, tuple[bool, float]] = {}
+
+_AP_CUSTOM_PREFIX = "a_panel_code"
+
+_DM_ONLY_MESSAGE = "\u274c Эта команда доступна только на сервере."
+_ISOLATION_MESSAGE = (
+    "\U0001f512 На данном сервере активирована изоляция.\n"
+    "Доступ к командам и действиям заблокирован Администратором Бота."
+)
+
+
+def _invalidate_isolation_cache(guild_id: int | None) -> None:
+    if guild_id is not None:
+        _isolation_cache.pop(guild_id, None)
+
+
+async def _is_guild_isolated(guild_id: int) -> bool:
+    now = time.monotonic()
+    cached = _isolation_cache.get(guild_id)
+    if cached is not None and now - cached[1] < _ISOLATION_CACHE_TTL:
+        return cached[0]
+    async with get_session() as session:
+        gs = await voting.get_or_create_guild_settings(session, guild_id)
+        isolated = bool(gs.isolation_enabled)
+    _isolation_cache[guild_id] = (isolated, now)
+    return isolated
+
+
+async def _tree_interaction_check(interaction: discord.Interaction) -> bool:
+    if interaction.type is discord.InteractionType.autocomplete:
+        return True
+
+    data = interaction.data or {}
+    if isinstance(data, dict) and data.get("name") == "a-panel":
+        return True
+
+    if interaction.type is discord.InteractionType.application_command and interaction.guild is None:
+        try:
+            await interaction.response.send_message(_DM_ONLY_MESSAGE, ephemeral=True)
+        except Exception:
+            pass
+        return False
+
+    if interaction.guild is not None:
+        isolated = await _is_guild_isolated(interaction.guild_id)
+        if isolated:
+            try:
+                await interaction.response.send_message(_ISOLATION_MESSAGE, ephemeral=True)
+            except Exception:
+                pass
+            return False
+
+    return True
+
+
+async def _component_allowed(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        return True
+
+    custom_id = getattr(interaction.data, "custom_id", None)
+    if isinstance(custom_id, str) and custom_id.startswith(_AP_CUSTOM_PREFIX):
+        return True
+
+    isolated = await _is_guild_isolated(interaction.guild_id)
+    if isolated:
+        try:
+            await interaction.response.send_message(_ISOLATION_MESSAGE, ephemeral=True)
+        except Exception:
+            pass
+        return False
+
+    return True
+
+
+def _patch_view_store_gate() -> None:
+    store = getattr(getattr(bot, "_connection", None), "_view_store", None)
+    if store is None:
+        logger.warning("ViewStore не найден — гейт компонентов не установлен.")
+        return
+
+    original_dispatch_view = store.dispatch_view
+    original_dispatch_modal = store.dispatch_modal
+
+    async def _gated_view(component_type, custom_id, interaction) -> None:
+        if await _component_allowed(interaction):
+            original_dispatch_view(component_type, custom_id, interaction)
+
+    async def _gated_modal(custom_id, interaction, components, resolved) -> None:
+        if await _component_allowed(interaction):
+            original_dispatch_modal(custom_id, interaction, components, resolved)
+
+    store.dispatch_view = _gated_view
+    store.dispatch_modal = _gated_modal
+
+
+bot.tree.interaction_check = _tree_interaction_check
+_patch_view_store_gate()
+
+
+class AdminPanelModal(discord.ui.Modal, title="Панель администратора бота"):
+    command_name: str = ""
+    param_value: str = ""
+
+    code = discord.ui.TextInput(
+        label="Код Администратора Бота",
+        placeholder="Введите код доступа из конфигурации",
+        min_length=1,
+        max_length=128,
+    )
+
+    def __init__(self, command_name: str, param_value: str) -> None:
+        self.command_name = command_name
+        self.param_value = param_value
+        super().__init__(custom_id=f"{_AP_CUSTOM_PREFIX}:{command_name}:{param_value}")
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(_DM_ONLY_MESSAGE, ephemeral=True)
+            return
+
+        if not settings.bot_admin_code:
+            await interaction.response.send_message(
+                "Код Администратора Бота не настроен. Задайте BOT_ADMIN_CODE в .env.",
+                ephemeral=True,
+            )
+            return
+
+        if (self.code.value or "").strip() != settings.bot_admin_code:
+            async with get_session() as session:
+                await audit.log_action(
+                    session,
+                    action="settings_changed",
+                    guild_id=interaction.guild_id,
+                    user_id=interaction.user.id,
+                    user_name=interaction.user.display_name,
+                    details={"admin_panel": "code_rejected"},
+                )
+                await session.commit()
+            await interaction.response.send_message(
+                "\U0001f6ab Неверный код Администратора Бота.",
+                ephemeral=True,
+            )
+            return
+
+        if self.command_name == "isolation":
+            new_value = self.param_value == "on"
+            async with get_session() as session:
+                gs = await voting.get_or_create_guild_settings(session, interaction.guild_id)
+                old_value = bool(gs.isolation_enabled)
+                gs.isolation_enabled = new_value
+                await audit.log_action(
+                    session,
+                    action="settings_changed",
+                    guild_id=interaction.guild_id,
+                    user_id=interaction.user.id,
+                    user_name=interaction.user.display_name,
+                    details={"admin_panel": "isolation", "value": new_value},
+                    old_value=str(int(old_value)),
+                    new_value=str(int(new_value)),
+                )
+                await session.commit()
+            _invalidate_isolation_cache(interaction.guild_id)
+            state_text = "включена" if new_value else "выключена"
+            await interaction.response.send_message(
+                f"\U0001f512 Изоляция сервера {state_text}.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "\u2753 Неизвестная команда панели администратора.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="a-panel", description="Панель администратора бота (требуется код доступа)")
+@app_commands.choices(
+    command=[
+        app_commands.Choice(name="Isolation", value="isolation"),
+    ],
+    param=[
+        app_commands.Choice(name="\u0412\u043a\u043b\u044e\u0447\u0451\u043d", value="on"),
+        app_commands.Choice(name="\u0412\u044b\u043a\u043b\u044e\u0447\u0435\u043d", value="off"),
+    ],
+)
+async def admin_panel_command(
+    interaction: discord.Interaction,
+    command: str,
+    param: str,
+) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(_DM_ONLY_MESSAGE, ephemeral=True)
+        return
+    await interaction.response.send_modal(AdminPanelModal(command_name=command, param_value=param))
 
 
 async def main() -> None:

@@ -79,6 +79,8 @@ class GuildSettings(Base, TimestampMixin):
     reminder_hours_before: Mapped[int] = mapped_column(Integer, default=4)
     reminder_interval_hours: Mapped[int] = mapped_column(Integer, default=6)
 
+    isolation_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     data_retention_days: Mapped[int] = mapped_column(Integer, default=365)
     auto_archive_days: Mapped[int] = mapped_column(Integer, default=30)
 
