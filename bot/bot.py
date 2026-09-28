@@ -2448,7 +2448,11 @@ async def _component_allowed(interaction: discord.Interaction) -> bool:
     if interaction.guild is None:
         return True
 
-    custom_id = getattr(interaction.data, "custom_id", None)
+    data = interaction.data or {}
+    if isinstance(data, dict):
+        custom_id = data.get("custom_id")
+    else:
+        custom_id = getattr(data, "custom_id", None)
     if isinstance(custom_id, str) and custom_id.startswith(_AP_CUSTOM_PREFIX):
         return True
 
