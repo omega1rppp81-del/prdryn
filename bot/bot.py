@@ -2472,13 +2472,23 @@ def _patch_view_store_gate() -> None:
     original_dispatch_view = store.dispatch_view
     original_dispatch_modal = store.dispatch_modal
 
-    async def _gated_view(component_type, custom_id, interaction) -> None:
+    async def _dispatch_view_safely(component_type, custom_id, interaction) -> None:
         if await _component_allowed(interaction):
             original_dispatch_view(component_type, custom_id, interaction)
 
-    async def _gated_modal(custom_id, interaction, components, resolved) -> None:
+    async def _dispatch_modal_safely(custom_id, interaction, components, resolved) -> None:
         if await _component_allowed(interaction):
             original_dispatch_modal(custom_id, interaction, components, resolved)
+
+    def _gated_view(component_type, custom_id, interaction) -> None:
+        asyncio.get_running_loop().create_task(
+            _dispatch_view_safely(component_type, custom_id, interaction)
+        )
+
+    def _gated_modal(custom_id, interaction, components, resolved) -> None:
+        asyncio.get_running_loop().create_task(
+            _dispatch_modal_safely(custom_id, interaction, components, resolved)
+        )
 
     store.dispatch_view = _gated_view
     store.dispatch_modal = _gated_modal
