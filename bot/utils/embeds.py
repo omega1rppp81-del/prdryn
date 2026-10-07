@@ -137,15 +137,31 @@ async def build_vote_embed(vote: "Vote", show_results: bool = True, session: "As
             inline=False,
         )
     elif vote.status == "open":
-        voted_count = len([p for p in (vote.participants or []) if p.has_voted])
-        total_eligible = 0
         if session is not None:
+            from sqlalchemy import func as sa_func
+            from sqlalchemy import select as sa_select
+
+            from bot.models.models import VoteParticipant
+
+            total_voted = (
+                await session.execute(
+                    sa_select(sa_func.count())
+                    .select_from(VoteParticipant)
+                    .where(
+                        VoteParticipant.vote_id == vote.id,
+                        VoteParticipant.has_voted == True,  # noqa: E712
+                    )
+                )
+            ).scalar() or 0
             from bot.services.voting import count_eligible_voters
 
             total_eligible = await count_eligible_voters(session, vote)
+        else:
+            total_voted = len([p for p in (vote.participants or []) if p.has_voted])
+            total_eligible = 0
         embed.add_field(
             name="── Проголосовало ──",
-            value=f"```ansi\n  \x1b[32m{voted_count}\x1b[0m из {total_eligible} участников\n```",
+            value=f"```ansi\n  \x1b[32m{total_voted}\x1b[0m из {total_eligible} участников\n```",
             inline=False,
         )
 
@@ -282,10 +298,80 @@ async def build_completed_embed(vote: "Vote", session: "AsyncSession | None" = N
 # ---------------------------------------------------------------------------
 
 
+def _center_cell(text: str, width: int, color: str | None = None) -> str:
+    if len(text) > width:
+        text = text[: width - 1] + "…" if width >= 1 else ""
+    pad = width - len(text)
+    left = pad // 2
+    right = pad - left
+    if color:
+        return " " * left + color + text + "\x1b[0m" + " " * right
+    return " " * left + text + " " * right
+
+
+def _box_table(headers: list[str], columns: list[list[str]], colors: list[str | None], max_chars: int = 1000) -> str:
+    n = len(headers)
+    # ANSI-коды невидимы при отрисовке, но входят в лимит символов поля Discord
+    max_chars -= sum(len(c) + 4 for c in colors if c)
+    rows = max((len(c) for c in columns), default=0)
+    cols = [list(c) for c in columns]
+    for c in cols:
+        c.extend([""] * (rows - len(c)))
+
+    min_w = [len(h) + 2 for h in headers]
+
+    def widths(cs: list[list[str]]) -> list[int]:
+        return [max(min_w[i], max((len(x) for x in cs[i]), default=0) + 2) for i in range(n)]
+
+    def total_chars(w: list[int], r: int) -> int:
+        s = sum(w)
+        return (r + 4) * (s + 4) + (r + 3)
+
+    # ── 1) Вмещаем строки в бюджет (иначе обрезаем хвосты, оставляя "…+N") ──
+    if rows:
+        s_min = sum(min_w)
+        capacity = (max_chars - (4 * s_min + 19)) // (s_min + 5)
+        if capacity < 2:
+            capacity = 2
+        if rows > capacity:
+            keep = capacity - 1
+            for c in cols:
+                if len(c) > keep:
+                    c[:] = c[:keep] + [f"…+{len(c) - keep}"]
+            rows = max(len(c) for c in cols)
+
+    # ── 2) Сужаем самую широкую колонку до тех пор, пока таблица не влезет ──
+    w = widths(cols)
+    while total_chars(w, rows) > max_chars:
+        deltas = [w[i] - min_w[i] for i in range(n)]
+        if max(deltas) <= 0:
+            break
+        w[deltas.index(max(deltas))] -= 1
+
+    # ── 3) Урезаем ячейки под итоговые ширины ──
+    for i in range(n):
+        limit = w[i] - 2
+        cols[i] = [
+            s if len(s) <= limit else (s[: limit - 1] + "…") if limit >= 1 else ""
+            for s in cols[i]
+        ]
+
+    top = "┌" + "┬".join("─" * x for x in w) + "┐"
+    sep = "├" + "┼".join("─" * x for x in w) + "┤"
+    bot = "└" + "┴".join("─" * x for x in w) + "┘"
+    head = "│" + "│".join(_center_cell(headers[i], w[i], colors[i]) for i in range(n)) + "│"
+
+    out = [top, head, sep]
+    for r in range(rows):
+        out.append("│" + "│".join(_center_cell(cols[i][r], w[i]) for i in range(n)) + "│")
+    out.append(bot)
+    return "\n".join(out)
+
+
 async def _build_council_table(session: "AsyncSession", vote: "Vote") -> str:
     from sqlalchemy import select
 
-    from bot.models import CouncilMember, VoteParticipant
+    from bot.models import CouncilMember, VoteParticipant, VoteOption
 
     members_result = await session.execute(
         select(CouncilMember)
@@ -305,28 +391,37 @@ async def _build_council_table(session: "AsyncSession", vote: "Vote") -> str:
     )
     votes_by_user = {p.user_id: p for p in participants_result.scalars().all()}
 
-    lines = []
+    options_result = await session.execute(
+        select(VoteOption).where(VoteOption.vote_id == vote.id).order_by(VoteOption.position)
+    )
+    options = list(options_result.scalars().all())
+
+    if options:
+        headers = [o.label for o in options]
+        id_to_col = {o.id: i for i, o in enumerate(options)}
+    else:
+        headers = ["ЗА", "ПРОТИВ", "ВОЗДЕРЖАЛСЯ"]
+        id_to_col = {}
+
+    columns: list[list[str]] = [[] for _ in headers]
+
     for m in members:
-        num = m.council_number
-        label = f"О5-{num}" if num is not None else "О5-?"
+        if m.council_number is not None:
+            label = f"О5-{m.council_number}"
+        else:
+            label = m.display_name or "—"
 
         participant = votes_by_user.get(m.user_id)
-        if participant and participant.option_id:
-            from bot.models import VoteOption
+        if participant and participant.option_id is not None:
+            idx = id_to_col.get(participant.option_id)
+            if idx is not None:
+                columns[idx].append(label)
 
-            opt_r = await session.execute(select(VoteOption).where(VoteOption.id == participant.option_id))
-            option = opt_r.scalar_one_or_none()
-            vl = option.label if option else "—"
+    if all(not c for c in columns):
+        columns = [["-" for _ in headers]]
 
-            ck = _VOTE_COLOR.get(vl, "d")
-            c = _A[ck]
-            sv = _VOTE_SYM.get(vl, "·")
-
-            lines.append(f"  {label:<8} {c}{sv}  {vl}\x1b[0m")
-        else:
-            lines.append(f"  {label:<8} \x1b[90m·  не голосовал\x1b[0m")
-
-    return "\n".join(lines)
+    colors = [_A[_VOTE_COLOR.get(h.upper(), "d")] for h in headers]
+    return _box_table(headers, columns, colors)
 
 
 # ---------------------------------------------------------------------------

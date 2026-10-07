@@ -87,7 +87,7 @@ async def _send_log_message(session: AsyncSession, entry: AuditLog) -> None:
         if entry.vote_id:
             desc_parts.append(f"Голосование ID: `{entry.vote_id}`")
         embed.description = "\n".join(desc_parts) or "—"
-        embed.timestamp = dt.datetime.utcnow()
+        embed.timestamp = dt.datetime.now(dt.timezone.utc)
 
         await channel.send(embed=embed)
     except Exception as e:

@@ -103,7 +103,21 @@ class VoteButtonView(discord.ui.View):
                     )
                     fresh_vote = result.scalar_one()
                     embed = await build_vote_embed(fresh_vote, session=session)
-                    await interaction.message.edit(embed=embed)
+                    try:
+                        await interaction.message.edit(embed=embed)
+                    except Exception:
+                        pass
+                    targets = await voting.get_vote_message_targets(session, fresh_vote)
+                    for ch_id, msg_id in targets:
+                        if ch_id == interaction.channel_id and msg_id == interaction.message.id:
+                            continue
+                        try:
+                            ch = interaction.client.get_channel(ch_id)
+                            if ch:
+                                m = await ch.fetch_message(msg_id)
+                                await m.edit(embed=embed)
+                        except Exception:
+                            continue
         except Exception:
             pass
 
@@ -338,7 +352,7 @@ class ExtendModal(discord.ui.Modal, title="Продление голосован
                 await interaction.followup.send("Голосование не найдено.", ephemeral=True)
                 return
 
-            current_end = vote.ends_at or dt.datetime.utcnow()
+            current_end = vote.ends_at or dt.datetime.now(dt.timezone.utc)
             new_end = current_end + dt.timedelta(hours=hours)
 
             await voting.extend_vote(session, vote, new_end)

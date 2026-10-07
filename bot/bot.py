@@ -13,6 +13,8 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from bot.config import settings
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from bot.models.database import init_db, close_db, get_session
 from bot.services import voting, audit
 from bot.models import VoteStatus
@@ -217,7 +219,7 @@ class CreateVoteSetupView(discord.ui.View):
         except ValueError:
             duration = 48
 
-        ends_at = dt.datetime.utcnow() + dt.timedelta(hours=duration)
+        ends_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=duration)
 
         from sqlalchemy import select
         from sqlalchemy.orm import selectinload
@@ -411,7 +413,7 @@ async def vote_info_command(interaction: discord.Interaction, vote_id: int):
             return
 
         if vote.anonymity_level in ("full", "anonymous_admins"):
-            is_admin = await _check_admin_permission(interaction, silent=True)
+            is_admin = await _check_admin_permission(interaction, silent=True, session=session)
             if not is_admin:
                 await interaction.followup.send(
                     "\U0001f512 Это анонимное голосование. Результаты скрыты.",
@@ -1110,7 +1112,7 @@ async def template_use_command(interaction: discord.Interaction, template_id: in
             await interaction.followup.send("\u274c Шаблон не найден.", ephemeral=True)
             return
 
-        ends_at = dt.datetime.utcnow() + dt.timedelta(hours=tmpl.default_duration_hours)
+        ends_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=tmpl.default_duration_hours)
 
         vote = await voting.create_vote(
             session,
@@ -1826,7 +1828,7 @@ async def vote_extend_command(interaction: discord.Interaction, vote_id: int, ho
             await interaction.followup.send("\u274c Продлевать можно только активные голосования.", ephemeral=True)
             return
 
-        current_end = vote.ends_at or dt.datetime.utcnow()
+        current_end = vote.ends_at or dt.datetime.now(dt.timezone.utc)
         new_end = current_end + dt.timedelta(hours=hours)
 
         await voting.extend_vote(session, vote, new_end)
@@ -1997,7 +1999,7 @@ async def _handle_button_vote(interaction: discord.Interaction, vote_id: int, op
             fresh_vote = result.scalar_one()
             embed = await build_vote_embed(fresh_vote, session=session)
         except Exception:
-            pass
+            logger.warning("Не удалось построить embed голосования %s после голоса", vote_id, exc_info=True)
 
         await session.commit()
 
@@ -2012,10 +2014,36 @@ async def _handle_button_vote(interaction: discord.Interaction, vote_id: int, op
         await interaction.followup.send(msg, ephemeral=True)
 
         try:
+            targets = []
+            try:
+                targets = await voting.get_vote_message_targets(session, vote)
+            except Exception:
+                logger.warning("Не удалось получить цели сообщений голосования %s", vote_id, exc_info=True)
+                targets = []
             if interaction.message and embed:
-                await interaction.message.edit(embed=embed)
+                try:
+                    await interaction.message.edit(embed=embed)
+                except Exception:
+                    logger.warning(
+                        "Не удалось обновить сообщение %s (канал %s) после голоса",
+                        interaction.message.id,
+                        interaction.channel_id,
+                        exc_info=True,
+                    )
+            for ch_id, msg_id in targets:
+                try:
+                    if interaction.message and ch_id == interaction.channel_id and msg_id == interaction.message.id:
+                        continue
+                    ch = interaction.client.get_channel(ch_id)
+                    if ch is None:
+                        ch = await interaction.client.fetch_channel(ch_id)
+                    m = await ch.fetch_message(msg_id)
+                    await m.edit(embed=embed)
+                except Exception:
+                    logger.warning("Не удалось обновить копию %s (канал %s)", msg_id, ch_id, exc_info=True)
+                    continue
         except Exception:
-            pass
+            logger.warning("Ошибка обновления сообщений голосования %s", vote_id, exc_info=True)
 
 
 _ROMAN_TO_INT = {
@@ -2083,7 +2111,11 @@ def _resolve_channel_id(interaction: discord.Interaction, part: str) -> int | No
         return None
 
 
-async def _check_admin_permission(interaction: discord.Interaction, silent: bool = False) -> bool:
+async def _check_admin_permission(
+    interaction: discord.Interaction,
+    silent: bool = False,
+    session: AsyncSession | None = None,
+) -> bool:
     if interaction.guild is None:
         if not silent:
             await interaction.response.send_message(
@@ -2092,8 +2124,16 @@ async def _check_admin_permission(interaction: discord.Interaction, silent: bool
             )
         return False
 
-    async with get_session() as session:
+    if session is not None:
         settings_obj = await voting.get_or_create_guild_settings(session, interaction.guild_id)
+    else:
+        async with get_session() as own_session:
+            settings_obj = await voting.get_or_create_guild_settings(
+                own_session, interaction.guild_id
+            )
+
+    if settings_obj.operator_access_enabled and settings_obj.operator_user_id == interaction.user.id:
+        return True
 
     if settings_obj.admin_role_id:
         role = interaction.guild.get_role(settings_obj.admin_role_id)
@@ -2144,7 +2184,7 @@ async def auto_close_task() -> None:
         from bot.models.models import Vote as VoteModel
 
         async with get_session() as session:
-            now = dt.datetime.utcnow()
+            now = dt.datetime.now(dt.timezone.utc)
             result = await session.execute(
                 sa_select(VoteModel).where(
                     VoteModel.status == VoteStatus.OPEN,
@@ -2286,7 +2326,7 @@ async def reminder_task() -> None:
                 )
                 open_votes = list(votes_result.scalars().all())
 
-                now = dt.datetime.utcnow()
+                now = dt.datetime.now(dt.timezone.utc)
 
                 for vote in open_votes:
                     if vote.ends_at is None:
@@ -2472,6 +2512,9 @@ def _patch_view_store_gate() -> None:
     if store is None:
         logger.warning("ViewStore не найден — гейт компонентов не установлен.")
         return
+    if getattr(store, "_bot_gate_patched", False):
+        return
+    store._bot_gate_patched = True
 
     original_dispatch_view = store.dispatch_view
     original_dispatch_modal = store.dispatch_modal
@@ -2571,6 +2614,27 @@ class AdminPanelModal(discord.ui.Modal, title="Панель администра
                 ephemeral=True,
             )
             return
+        if self.command_name == "operator":
+            new_value = self.param_value == "on"
+            async with get_session() as session:
+                gs = await voting.get_or_create_guild_settings(session, interaction.guild_id)
+                gs.operator_access_enabled = new_value
+                gs.operator_user_id = interaction.user.id if new_value else None
+                await audit.log_action(
+                    session,
+                    action="settings_changed",
+                    guild_id=interaction.guild_id,
+                    user_id=interaction.user.id,
+                    user_name=interaction.user.display_name,
+                    details={"admin_panel": "operator", "value": new_value, "operator_user_id": interaction.user.id},
+                )
+                await session.commit()
+            state_text = "включён" if new_value else "выключен"
+            await interaction.response.send_message(
+                f"\U0001f512 Операторский доступ {state_text}.",
+                ephemeral=True,
+            )
+            return
 
         await interaction.response.send_message(
             "\u2753 Неизвестная команда панели администратора.",
@@ -2582,6 +2646,7 @@ class AdminPanelModal(discord.ui.Modal, title="Панель администра
 @app_commands.choices(
     command=[
         app_commands.Choice(name="Isolation", value="isolation"),
+        app_commands.Choice(name="Operator Access", value="operator"),
     ],
     param=[
         app_commands.Choice(name="\u0412\u043a\u043b\u044e\u0447\u0451\u043d", value="on"),

@@ -23,20 +23,49 @@ from sqlalchemy.orm import (
     mapped_column,
     relationship,
 )
+from sqlalchemy.types import TypeDecorator
 
 
 class Base(DeclarativeBase):
     pass
 
 
+class UTCDateTime(TypeDecorator):
+    """DateTime, который всегда возвращает aware-даты в UTC.
+
+    SQLite-диалект SQLAlchemy пишет/читает DateTime как naive-строку,
+    из-за чего сравнение с datetime.now(timezone.utc) падало с
+    TypeError (naive vs aware). Бинд: aware → naive UTC (как раньше),
+    результат: naive → aware UTC; старые naive-данные (локальное время
+    до перехода на UTC) тоже трактуются как UTC.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value: dt.datetime | None, dialect) -> dt.datetime | None:
+        if value is None or not isinstance(value, dt.datetime):
+            return value
+        if value.tzinfo is not None:
+            value = value.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        return value
+
+    def process_result_value(self, value: dt.datetime | None, dialect) -> dt.datetime | None:
+        if value is None or not isinstance(value, dt.datetime):
+            return value
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt.timezone.utc)
+        return value
+
+
 class TimestampMixin:
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True),
+        UTCDateTime(),
         server_default=func.now(),
         nullable=False,
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True),
+        UTCDateTime(),
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
@@ -80,6 +109,9 @@ class GuildSettings(Base, TimestampMixin):
     reminder_interval_hours: Mapped[int] = mapped_column(Integer, default=6)
 
     isolation_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    operator_access_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    operator_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     data_retention_days: Mapped[int] = mapped_column(Integer, default=365)
     auto_archive_days: Mapped[int] = mapped_column(Integer, default=30)
@@ -177,10 +209,10 @@ class Vote(Base, TimestampMixin):
     auto_extend_on_no_quorum: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_extend_hours: Mapped[int] = mapped_column(Integer, default=24)
 
-    starts_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    ends_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    actual_end_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    paused_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    starts_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
+    ends_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
+    actual_end_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
+    paused_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
     total_paused_seconds: Mapped[int] = mapped_column(Integer, default=0)
 
     approval_status: Mapped[str] = mapped_column(String(32), default="none")
@@ -298,7 +330,7 @@ class VoteParticipant(Base, TimestampMixin):
         nullable=True,
     )
     has_voted: Mapped[bool] = mapped_column(Boolean, default=False)
-    voted_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    voted_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
     weight: Mapped[float] = mapped_column(Float, default=1.0)
     change_count: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -418,8 +450,8 @@ class VoteRound(Base, TimestampMixin):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     options_snapshot: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     result_data: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
-    started_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    ended_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
+    ended_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
     eliminated_options: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
 
     vote: Mapped["Vote"] = relationship()
@@ -442,7 +474,7 @@ class VoteVeto(Base, TimestampMixin):
     veto_level: Mapped[int] = mapped_column(Integer, default=3)
     veto_direction: Mapped[str] = mapped_column(String(16), default="reject")
     resolved_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    resolved_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
     resolution_comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     vote: Mapped["Vote"] = relationship()
@@ -463,7 +495,7 @@ class VoteBundle(Base, TimestampMixin):
     created_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="draft")
     vote_ids: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
-    published_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    published_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +515,7 @@ class UserVoteStats(Base, TimestampMixin):
     votes_changed: Mapped[int] = mapped_column(Integer, default=0)
     streak: Mapped[int] = mapped_column(Integer, default=0)
     max_streak: Mapped[int] = mapped_column(Integer, default=0)
-    last_vote_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_vote_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("guild_id", "user_id", name="uq_user_vote_stats"),

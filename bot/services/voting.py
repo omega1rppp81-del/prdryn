@@ -4,7 +4,7 @@ import datetime as dt
 import re
 from typing import Optional
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, inspect, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -177,7 +177,7 @@ async def create_vote(
         starts_at=starts_at,
         ends_at=ends_at,
         related_vote_id=related_vote_id,
-        status=VoteStatus.DRAFT if starts_at and starts_at > dt.datetime.utcnow() else VoteStatus.DRAFT,
+        status=VoteStatus.DRAFT if starts_at and starts_at > dt.datetime.now(dt.timezone.utc) else VoteStatus.DRAFT,
     )
     session.add(vote)
     await session.flush()
@@ -207,7 +207,7 @@ def _get_default_options(vote_type: str) -> list[str]:
 async def open_vote(session: AsyncSession, vote: Vote) -> Vote:
     vote.status = VoteStatus.OPEN
     if not vote.starts_at:
-        vote.starts_at = dt.datetime.utcnow()
+        vote.starts_at = dt.datetime.now(dt.timezone.utc)
     if not vote.actual_end_at:
         vote.actual_end_at = None
 
@@ -245,7 +245,7 @@ async def open_vote(session: AsyncSession, vote: Vote) -> Vote:
 
 async def complete_vote(session: AsyncSession, vote: Vote, reason: str | None = None) -> Vote:
     vote.status = VoteStatus.COMPLETED
-    vote.actual_end_at = dt.datetime.utcnow()
+    vote.actual_end_at = dt.datetime.now(dt.timezone.utc)
     vote.completion_reason = reason or "Срок голосования истёк"
     await session.flush()
     return vote
@@ -254,21 +254,21 @@ async def complete_vote(session: AsyncSession, vote: Vote, reason: str | None = 
 async def cancel_vote(session: AsyncSession, vote: Vote, reason: str) -> Vote:
     vote.status = VoteStatus.CANCELLED
     vote.cancel_reason = reason
-    vote.actual_end_at = dt.datetime.utcnow()
+    vote.actual_end_at = dt.datetime.now(dt.timezone.utc)
     await session.flush()
     return vote
 
 
 async def pause_vote(session: AsyncSession, vote: Vote) -> Vote:
     vote.status = VoteStatus.PAUSED
-    vote.paused_at = dt.datetime.utcnow()
+    vote.paused_at = dt.datetime.now(dt.timezone.utc)
     await session.flush()
     return vote
 
 
 async def resume_vote(session: AsyncSession, vote: Vote) -> Vote:
     if vote.paused_at:
-        paused_duration = dt.datetime.utcnow() - vote.paused_at
+        paused_duration = dt.datetime.now(dt.timezone.utc) - vote.paused_at
         vote.total_paused_seconds += int(paused_duration.total_seconds())
         vote.paused_at = None
     vote.status = VoteStatus.OPEN
@@ -307,14 +307,19 @@ async def cast_vote(
             user_name=user_name,
             option_id=option_id,
             has_voted=True,
-            voted_at=dt.datetime.utcnow(),
+            voted_at=dt.datetime.now(dt.timezone.utc),
             weight=weight,
         )
         session.add(participant)
+        # vote.participants может быть уже загружена в этой же сессии (identity map
+        # не обновляет коллекцию при повторном selectinload) — добавляем вручную,
+        # иначе счётчик «Проголосовало n из y» в embed остаётся старым.
+        if "participants" not in inspect(vote).unloaded:
+            vote.participants.append(participant)
     else:
         participant.option_id = option_id
         participant.has_voted = True
-        participant.voted_at = dt.datetime.utcnow()
+        participant.voted_at = dt.datetime.now(dt.timezone.utc)
         participant.weight = weight
         participant.change_count += 1
 
@@ -432,7 +437,7 @@ async def calculate_results(session: AsyncSession, vote: Vote) -> dict:
         "quorum_reached": quorum_reached,
         "winner": winner,
         "abstain_count": abstain_count,
-        "calculated_at": dt.datetime.utcnow().isoformat(),
+        "calculated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
 
     vote.result_data = result_data
@@ -498,7 +503,7 @@ async def check_user_can_vote(session: AsyncSession, vote: Vote, user_id: int) -
     if vote.status != VoteStatus.OPEN:
         return False, "Голосование не активно"
 
-    if vote.ends_at and dt.datetime.utcnow() > vote.ends_at:
+    if vote.ends_at and dt.datetime.now(dt.timezone.utc) > vote.ends_at:
         return False, "Срок голосования истёк"
 
     member_result = await session.execute(
@@ -880,7 +885,7 @@ async def resolve_veto(
         return False
     veto.status = resolution
     veto.resolved_by = resolved_by
-    veto.resolved_at = dt.datetime.utcnow()
+    veto.resolved_at = dt.datetime.now(dt.timezone.utc)
     veto.resolution_comment = comment
     await session.flush()
     return True
@@ -938,7 +943,7 @@ async def start_round(session: AsyncSession, round_id: int) -> bool:
     if not rnd:
         return False
     rnd.status = "active"
-    rnd.started_at = dt.datetime.utcnow()
+    rnd.started_at = dt.datetime.now(dt.timezone.utc)
     await session.flush()
     return True
 
@@ -958,7 +963,7 @@ async def complete_round(
     if not rnd:
         return False
     rnd.status = "completed"
-    rnd.ended_at = dt.datetime.utcnow()
+    rnd.ended_at = dt.datetime.now(dt.timezone.utc)
     rnd.result_data = result_data
     rnd.eliminated_options = eliminated
     await session.flush()
@@ -996,7 +1001,7 @@ async def update_user_stats(
 
     if is_new_vote:
         stats.total_votes_cast += 1
-        stats.last_vote_at = dt.datetime.utcnow()
+        stats.last_vote_at = dt.datetime.now(dt.timezone.utc)
 
         if is_mandatory:
             stats.total_mandatory += 1
@@ -1142,6 +1147,6 @@ async def publish_bundle(session: AsyncSession, bundle_id: int) -> bool:
     if not bundle:
         return False
     bundle.status = "published"
-    bundle.published_at = dt.datetime.utcnow()
+    bundle.published_at = dt.datetime.now(dt.timezone.utc)
     await session.flush()
     return True
