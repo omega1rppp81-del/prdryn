@@ -72,7 +72,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from bot.models import database as db  # noqa: E402
 from bot.models.models import Base, CouncilMember, VoteParticipant  # noqa: E402
 from bot.services import audit, voting  # noqa: E402
-from bot.utils.embeds import build_vote_embed  # noqa: E402
 
 import bot.bot as bb  # noqa: E402
 
@@ -444,18 +443,8 @@ async def _cmd_simulate(args: list[str]) -> None:
             fresh = await voting.get_vote_by_id(session, vote_id)
             if fresh is None:
                 return
-            targets = await voting.get_vote_message_targets(session, fresh)
-            embed = await build_vote_embed(fresh, show_results=True, session=session)
-            for channel_id, message_id in targets:
-                try:
-                    channel = bb.bot.get_channel(channel_id)
-                    if channel is None:
-                        channel = await bb.bot.fetch_channel(channel_id)
-                    message = await channel.fetch_message(message_id)
-                    await message.edit(embed=embed)
-                    log.info("Обновлено сообщение %s (канал %s).", message_id, channel_id)
-                except Exception as exc:
-                    log.warning("Сообщение %s не обновлено: %r", message_id, exc)
+            updated = await voting.refresh_vote_messages(session, fresh, bb.bot)
+            log.info("Обновлено сообщений: %d.", updated)
     except Exception:
         log.exception("Ошибка обновления опубликованных сообщений.")
 

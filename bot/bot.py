@@ -5,7 +5,6 @@ import datetime as dt
 import logging
 import re
 import time
-import unicodedata
 from typing import Any
 
 import discord
@@ -18,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.models.database import init_db, close_db, get_session
 from bot.services import voting, audit
 from bot.models import VoteStatus
+from bot.utils.council import parse_council_number as _parse_council_number
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +157,7 @@ class CreateVoteSetupView(discord.ui.View):
         self.is_mandatory = False
         self.change_mode = "none"
         self.custom_options: list[str] | None = None
+        self.max_multi_choices: int | None = None
 
     @discord.ui.select(
         placeholder="Тип голосования",
@@ -198,14 +199,30 @@ class CreateVoteSetupView(discord.ui.View):
         self.change_mode = select.values[0]
         await interaction.response.defer()
 
-    @discord.ui.button(label="Обязательное: Нет", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.select(
+        placeholder="Максимум вариантов (для множественного выбора)",
+        options=[
+            discord.SelectOption(label="Не задано (по умолчанию: до 3)", value="0", emoji="\u26aa"),
+            discord.SelectOption(label="До 2 вариантов", value="2", emoji="\U0001f534"),
+            discord.SelectOption(label="До 3 вариантов", value="3", emoji="\U0001f7e1"),
+            discord.SelectOption(label="До 4 вариантов", value="4", emoji="\U0001f7e2"),
+            discord.SelectOption(label="До 5 вариантов", value="5", emoji="\U0001f7e3"),
+        ],
+        row=3,
+    )
+    async def max_choices_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        value = int(select.values[0])
+        self.max_multi_choices = value if value > 0 else None
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Обязательное: Нет", style=discord.ButtonStyle.secondary, row=4)
     async def mandatory_toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.is_mandatory = not self.is_mandatory
         button.label = f"Обязательное: {'Да' if self.is_mandatory else 'Нет'}"
         button.style = discord.ButtonStyle.success if self.is_mandatory else discord.ButtonStyle.secondary
         await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="Свои варианты", style=discord.ButtonStyle.primary, row=3)
+    @discord.ui.button(label="Свои варианты", style=discord.ButtonStyle.primary, row=4)
     async def custom_options_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         modal = CustomOptionsModal(parent_view=self)
         await interaction.response.send_modal(modal)
@@ -240,6 +257,7 @@ class CreateVoteSetupView(discord.ui.View):
                 change_mode=self.change_mode,
                 is_mandatory=self.is_mandatory,
                 custom_options=self.custom_options,
+                max_multi_choices=self.max_multi_choices,
                 ends_at=ends_at,
             )
 
@@ -271,31 +289,10 @@ class CreateVoteSetupView(discord.ui.View):
 
             channel_id = settings_obj.vote_channel_id or interaction.channel_id
 
-            from bot.utils.embeds import build_vote_embed
+            from bot.utils.embeds import build_vote_embed, build_vote_view
 
             embed = await build_vote_embed(vote, session=session)
-
-            view = discord.ui.View(timeout=None)
-            for opt in (vote.options or []):
-                if opt.label == "ЗА":
-                    style = discord.ButtonStyle.success
-                    emoji = "\U0001f7e2"
-                elif opt.label == "ПРОТИВ":
-                    style = discord.ButtonStyle.danger
-                    emoji = "\U0001f534"
-                elif opt.label in ("ВОЗДЕРЖАЛСЯ", "ВОЗДЕРЖАТЬСЯ"):
-                    style = discord.ButtonStyle.secondary
-                    emoji = "\U0001f7e1"
-                else:
-                    style = discord.ButtonStyle.primary
-                    emoji = None
-                btn = discord.ui.Button(
-                    label=opt.label,
-                    custom_id=f"vote_{vote.id}_{opt.id}",
-                    style=style,
-                    emoji=emoji,
-                )
-                view.add_item(btn)
+            view = build_vote_view(vote)
 
         channel = interaction.client.get_channel(channel_id)
         if not channel:
@@ -510,22 +507,8 @@ async def cancel_vote_command(interaction: discord.Interaction, vote_id: int, re
             details={"reason": reason},
         )
 
-        targets = await voting.get_vote_message_targets(session, vote)
         await session.commit()
-
-    for ch_id, msg_id in targets:
-            try:
-                channel = bot.get_channel(ch_id)
-                if channel:
-                    msg = await channel.fetch_message(msg_id)
-                    embed = discord.Embed(
-                        title=f"\u274c ГОСОВАНИЕ #{vote.vote_number} ОТМЕНЕНО",
-                        description=f"**Причина:** {reason}",
-                        color=0xED4245,
-                    )
-                    await msg.edit(embed=embed, view=None)
-            except Exception:
-                pass
+        await voting.refresh_vote_messages(session, vote, bot)
 
     await interaction.followup.send("\u2705 Голосование отменено.", ephemeral=True)
 
@@ -561,36 +544,8 @@ async def complete_vote_command(interaction: discord.Interaction, vote_id: int, 
             details={"reason": reason},
         )
 
-        embed = None
-        if vote.message_id and vote.channel_id:
-            try:
-                from sqlalchemy import select as sa_select
-                from sqlalchemy.orm import selectinload
-                from bot.models.models import Vote as VoteModel
-                from bot.utils.embeds import build_completed_embed
-
-                result2 = await session.execute(
-                    sa_select(VoteModel)
-                    .where(VoteModel.id == vote.id)
-                    .options(selectinload(VoteModel.options), selectinload(VoteModel.participants))
-                )
-                fresh_vote = result2.scalar_one()
-                embed = await build_completed_embed(fresh_vote, session)
-            except Exception:
-                pass
-
-        targets = await voting.get_vote_message_targets(session, vote)
         await session.commit()
-
-        if embed:
-            for ch_id, msg_id in targets:
-                try:
-                    channel = bot.get_channel(ch_id)
-                    if channel:
-                        msg = await channel.fetch_message(msg_id)
-                        await msg.edit(embed=embed, view=None)
-                except Exception:
-                    pass
+        await voting.refresh_vote_messages(session, vote, bot)
 
     await interaction.followup.send("\u2705 Голосование завершено.", ephemeral=True)
 
@@ -1214,78 +1169,22 @@ async def vote_veto_command(
             )
             return
 
-        settings_obj = await voting.get_or_create_guild_settings(session, interaction.guild_id)
-
-        cm = await session.execute(
-            select(CouncilMember).where(
-                CouncilMember.guild_id == interaction.guild_id,
-                CouncilMember.user_id == interaction.user.id,
-                CouncilMember.is_active == True,
-            )
+        res = await voting.apply_veto(
+            session, vote, interaction.user.id, reason,
+            user_name=interaction.user.display_name, direction=direction,
         )
-        cm_obj = cm.scalar_one_or_none()
-
-        if cm_obj is None or cm_obj.veto_level is None:
+        if res is None:
             await interaction.followup.send(
                 "\u274c У вас нет права ВЕТО.", ephemeral=True
             )
             return
 
-        auto_level = cm_obj.veto_level
-
-        veto = await voting.cast_veto(
-            session, vote_id, interaction.user.id, reason,
-            interaction.user.display_name, veto_level=auto_level, veto_direction=direction,
-        )
-
-        await voting.calculate_results(session, vote)
-
-        roman = {1: "I", 2: "II", 3: "III"}.get(auto_level, str(auto_level))
-        dir_text = "отклонение" if direction == "reject" else "одобрение"
-        veto_reason = f"Вето {roman} ({dir_text}): {reason}"
-
-        await voting.complete_vote(session, vote, reason=veto_reason)
-
-        await audit.log_action(
-            session,
-            action="veto_cast",
-            guild_id=interaction.guild_id,
-            vote_id=vote_id,
-            user_id=interaction.user.id,
-            user_name=interaction.user.display_name,
-            details={"action": "veto_cast", "reason": reason, "level": auto_level, "direction": direction},
-        )
-
-        embed = None
-        if vote.message_id and vote.channel_id:
-            try:
-                result2 = await session.execute(
-                    select(Vote)
-                    .where(Vote.id == vote.id)
-                    .options(selectinload(Vote.options), selectinload(Vote.participants))
-                )
-                fresh_vote = result2.scalar_one()
-                from bot.utils.embeds import build_completed_embed
-                embed = await build_completed_embed(fresh_vote, session)
-            except Exception:
-                pass
-
-        targets = await voting.get_vote_message_targets(session, vote)
         await session.commit()
-
-    if embed:
-        for ch_id, msg_id in targets:
-            try:
-                channel = interaction.client.get_channel(ch_id)
-                if channel:
-                    msg = await channel.fetch_message(msg_id)
-                    await msg.edit(embed=embed, view=None)
-            except Exception:
-                pass
+        await voting.refresh_vote_messages(session, vote, interaction.client)
 
     await interaction.followup.send(
-        f"\u2705 Вето **{roman}** уровня наложено на голосование #{vote.vote_number}\n"
-        f"**Направление:** {dir_text}\n"
+        f"\u2705 Вето **{res['roman']}** уровня наложено на голосование #{vote.vote_number}\n"
+        f"**Направление:** {res['dir_text']}\n"
         f"**Причина:** {reason}\n"
         f"Голосование завершено.",
         ephemeral=True,
@@ -1843,6 +1742,7 @@ async def vote_extend_command(interaction: discord.Interaction, vote_id: int, ho
             details={"hours": hours, "new_end": new_end.isoformat()},
         )
         await session.commit()
+        await voting.refresh_vote_messages(session, vote, bot)
 
     await interaction.followup.send(
         f"\u2705 Голосование #{vote.vote_number} продлено до {discord.utils.format_dt(new_end, 'f')}",
@@ -1883,6 +1783,7 @@ async def vote_pause_command(interaction: discord.Interaction, vote_id: int):
             user_name=interaction.user.display_name,
         )
         await session.commit()
+        await voting.refresh_vote_messages(session, vote, bot)
 
     await interaction.followup.send(f"\u23f8\ufe0f Голосование #{vote.vote_number} приостановлено.", ephemeral=True)
 
@@ -1916,6 +1817,7 @@ async def vote_resume_command(interaction: discord.Interaction, vote_id: int):
             user_name=interaction.user.display_name,
         )
         await session.commit()
+        await voting.refresh_vote_messages(session, vote, bot)
 
     await interaction.followup.send(f"\u25b6\ufe0f Голосование #{vote.vote_number} возобновлено.", ephemeral=True)
 
@@ -1929,6 +1831,47 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         return
 
     custom_id = interaction.data.get("custom_id", "")
+
+    if custom_id.startswith("mvok_"):
+        try:
+            await _handle_multi_confirm(interaction, int(custom_id.split("_")[1]))
+        except (ValueError, IndexError):
+            pass
+        return
+
+    if custom_id.startswith("mv_"):
+        try:
+            parts = custom_id.split("_")
+            await _handle_multi_toggle(interaction, int(parts[1]), int(parts[2]))
+        except (ValueError, IndexError):
+            pass
+        return
+
+    if custom_id.startswith("vrevoke_"):
+        try:
+            await _handle_button_revoke(interaction, int(custom_id.split("_")[1]))
+        except (ValueError, IndexError):
+            pass
+        return
+
+    if custom_id.startswith("vdir_"):
+        try:
+            parts = custom_id.split("_")
+            vote_id = int(parts[1])
+            direction = parts[2]
+            if direction not in ("reject", "confirm"):
+                direction = "reject"
+            await _handle_button_veto_direction(interaction, vote_id, direction)
+        except (ValueError, IndexError):
+            pass
+        return
+
+    if custom_id.startswith("veto_"):
+        try:
+            await _handle_button_veto(interaction, int(custom_id.split("_")[1]))
+        except (ValueError, IndexError):
+            pass
+        return
 
     if custom_id.startswith("vote_"):
         parts = custom_id.split("_")
@@ -1965,13 +1908,17 @@ async def _handle_button_vote(interaction: discord.Interaction, vote_id: int, op
             await interaction.followup.send("Вариант не найден.", ephemeral=True)
             return
 
-        participant = await voting.cast_vote(
-            session,
-            vote,
-            interaction.user.id,
-            target_option.id,
-            user_name=interaction.user.display_name,
-        )
+        try:
+            participant = await voting.cast_vote(
+                session,
+                vote,
+                interaction.user.id,
+                target_option.id,
+                user_name=interaction.user.display_name,
+            )
+        except ValueError as e:
+            await interaction.followup.send(f"\u274c {e}", ephemeral=True)
+            return
 
         action = "vote_cast" if participant.change_count == 0 else "vote_changed"
         await audit.log_action(
@@ -1984,24 +1931,11 @@ async def _handle_button_vote(interaction: discord.Interaction, vote_id: int, op
             details={"option": target_option.label, "change_count": participant.change_count},
         )
 
-        embed = None
-        try:
-            from bot.utils.embeds import build_vote_embed
-            from sqlalchemy import select as sa_select
-            from sqlalchemy.orm import selectinload
-            from bot.models.models import Vote as VoteModel
-
-            result = await session.execute(
-                sa_select(VoteModel)
-                .where(VoteModel.id == vote.id)
-                .options(selectinload(VoteModel.options), selectinload(VoteModel.participants))
-            )
-            fresh_vote = result.scalar_one()
-            embed = await build_vote_embed(fresh_vote, session=session)
-        except Exception:
-            logger.warning("Не удалось построить embed голосования %s после голоса", vote_id, exc_info=True)
-
         await session.commit()
+        try:
+            await voting.refresh_vote_messages(session, vote, interaction.client)
+        except Exception:
+            logger.warning("Не удалось обновить сообщения голосования %s после голоса", vote_id, exc_info=True)
 
         emoji_map = {"ЗА": "\U0001f7e2", "ПРОТИВ": "\U0001f534", "ВОЗДЕРЖАЛСЯ": "\u26aa"}
         emoji = emoji_map.get(target_option.label, "\U0001f535")
@@ -2013,67 +1947,337 @@ async def _handle_button_vote(interaction: discord.Interaction, vote_id: int, op
 
         await interaction.followup.send(msg, ephemeral=True)
 
-        try:
-            targets = []
+
+# Состояние выбора для мультивыбора: {(vote_id, user_id): {"opts": [...], "msg_id": int}}
+_multi_selections: dict[tuple[int, int], dict] = {}
+
+
+async def _handle_multi_toggle(interaction: discord.Interaction, vote_id: int, option_id: int) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    async with get_session() as session:
+        vote = await voting.get_vote_by_id(session, vote_id, interaction.guild_id)
+        if not vote:
+            await interaction.followup.send("\u274c Голосование не найдено.", ephemeral=True)
+            return
+
+        can_vote, reason = await voting.check_user_can_vote(session, vote, interaction.user.id)
+        if not can_vote:
+            await interaction.followup.send(f"\u274c {reason}", ephemeral=True)
+            return
+
+        target = None
+        for opt in (vote.options or []):
+            if opt.id == option_id:
+                target = opt
+                break
+        if target is None:
+            await interaction.followup.send("Вариант не найден.", ephemeral=True)
+            return
+
+        labels = {o.id: o.label for o in (vote.options or [])}
+        key = (vote_id, interaction.user.id)
+        state = _multi_selections.get(key)
+        opts: list[int] = list(state["opts"]) if state else []
+        prev_msg_id = state.get("msg_id") if state else None
+
+        if option_id in opts:
+            opts.remove(option_id)
+            action_text = f"убран вариант **{target.label}**"
+        else:
+            limit = vote.max_multi_choices or len(vote.options or []) or 1
+            if len(opts) >= limit:
+                await interaction.followup.send(
+                    f"\u274c Можно выбрать не более {limit} вариантов.", ephemeral=True
+                )
+                return
+            opts.append(option_id)
+            action_text = f"добавлен вариант **{target.label}**"
+
+        if opts:
+            _multi_selections[key] = {"opts": opts, "msg_id": prev_msg_id}
+        else:
+            _multi_selections.pop(key, None)
+
+        selected_text = ", ".join(f"**{labels.get(o, o)}**" for o in opts) or "—"
+        status = (
+            f"\u2705 {action_text}\n"
+            f"**Выбрано ({len(opts)}):** {selected_text}\n"
+            f"Нажмите **«Подтвердить выбор»** в сообщении голосования, чтобы проголосовать."
+        )
+
+        if prev_msg_id:
             try:
-                targets = await voting.get_vote_message_targets(session, vote)
+                await interaction.followup.edit_message(prev_msg_id, content=status)
+                return
             except Exception:
-                logger.warning("Не удалось получить цели сообщений голосования %s", vote_id, exc_info=True)
-                targets = []
-            if interaction.message and embed:
-                try:
-                    await interaction.message.edit(embed=embed)
-                except Exception:
-                    logger.warning(
-                        "Не удалось обновить сообщение %s (канал %s) после голоса",
-                        interaction.message.id,
-                        interaction.channel_id,
-                        exc_info=True,
-                    )
-            for ch_id, msg_id in targets:
-                try:
-                    if interaction.message and ch_id == interaction.channel_id and msg_id == interaction.message.id:
-                        continue
-                    ch = interaction.client.get_channel(ch_id)
-                    if ch is None:
-                        ch = await interaction.client.fetch_channel(ch_id)
-                    m = await ch.fetch_message(msg_id)
-                    await m.edit(embed=embed)
-                except Exception:
-                    logger.warning("Не удалось обновить копию %s (канал %s)", msg_id, ch_id, exc_info=True)
-                    continue
+                logger.warning(
+                    "Не удалось обновить статус-сообщение %s голосования %s",
+                    prev_msg_id, vote_id, exc_info=True,
+                )
+
+        msg = await interaction.followup.send(status, ephemeral=True, wait=True)
+        st = _multi_selections.get(key)
+        if st and msg is not None:
+            st["msg_id"] = msg.id
+
+
+async def _handle_multi_confirm(interaction: discord.Interaction, vote_id: int) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    key = (vote_id, interaction.user.id)
+    state = _multi_selections.pop(key, None)
+    opts: list[int] = list(state["opts"]) if state else []
+
+    if not opts:
+        await interaction.followup.send(
+            "\u274c Сначала выберите варианты кнопками в сообщении голосования.",
+            ephemeral=True,
+        )
+        return
+
+    async with get_session() as session:
+        vote = await voting.get_vote_by_id(session, vote_id, interaction.guild_id)
+        if not vote:
+            if state is not None:
+                _multi_selections[key] = state
+            await interaction.followup.send("\u274c Голосование не найдено.", ephemeral=True)
+            return
+
+        can_vote, reason = await voting.check_user_can_vote(session, vote, interaction.user.id)
+        if not can_vote:
+            if state is not None:
+                _multi_selections[key] = state
+            await interaction.followup.send(f"\u274c {reason}", ephemeral=True)
+            return
+
+        labels = {o.id: o.label for o in (vote.options or [])}
+        try:
+            participant = await voting.cast_vote(
+                session, vote, interaction.user.id, opts[0],
+                user_name=interaction.user.display_name, option_ids=opts,
+            )
+        except ValueError as e:
+            if state is not None:
+                _multi_selections[key] = state
+            await interaction.followup.send(f"\u274c {e}", ephemeral=True)
+            return
+
+        chosen = [labels.get(o, str(o)) for o in opts]
+        action = "vote_cast" if participant.change_count == 0 else "vote_changed"
+        await audit.log_action(
+            session,
+            action=action,
+            guild_id=vote.guild_id,
+            vote_id=vote.id,
+            user_id=interaction.user.id,
+            user_name=interaction.user.display_name,
+            details={"options": chosen, "change_count": participant.change_count},
+        )
+
+        await session.commit()
+        try:
+            await voting.refresh_vote_messages(session, vote, interaction.client)
         except Exception:
-            logger.warning("Ошибка обновления сообщений голосования %s", vote_id, exc_info=True)
+            logger.warning(
+                "Не удалось обновить сообщения голосования %s после голоса",
+                vote_id, exc_info=True,
+            )
+
+    chosen_text = ", ".join(chosen)
+    if participant.change_count > 0:
+        msg = f"\u2705 Голос изменён: {chosen_text}"
+    else:
+        msg = f"\u2705 Голос принят: {chosen_text}"
+    await interaction.followup.send(msg, ephemeral=True)
 
 
-_ROMAN_TO_INT = {
-    "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7,
-    "VIII": 8, "IX": 9, "X": 10, "XI": 11, "XII": 12, "XIII": 13,
-}
+async def _handle_button_revoke(interaction: discord.Interaction, vote_id: int) -> None:
+    from sqlalchemy import select as sa_select
 
-_COUNCIL_NUMBER_RE = re.compile(
-    r"[OoОо][\s\-_–—:.．·]*\d+[\s\-_–—:.．·]+[OoОо]?[\s\-_–—:.．·]*"
-    r"(\d{1,3}|X{0,2}I{0,3}|IX|IV|V?I{1,3})"
-)
+    from bot.models.models import VoteParticipant as VoteParticipantModel
 
+    await interaction.response.defer(ephemeral=True)
 
-def _parse_council_number(display_name: str) -> int | None:
-    if not display_name:
-        return None
-    name = unicodedata.normalize("NFKC", display_name)
-    name = (
-        name.replace("\u2013", "-")
-        .replace("\u2014", "-")
-        .replace("\u2212", "-")
-        .replace("\u2015", "-")
+    async with get_session() as session:
+        vote = await voting.get_vote_by_id(session, vote_id, interaction.guild_id)
+        if not vote:
+            await interaction.followup.send("\u274c Голосование не найдено.", ephemeral=True)
+            return
+
+        if vote.status != "open":
+            await interaction.followup.send("\u274c Голосование не активно.", ephemeral=True)
+            return
+
+        if vote.change_mode != "revoke":
+            await interaction.followup.send(
+                "\u274c В этом голосовании отзыв голоса не предусмотрен.", ephemeral=True
+            )
+            return
+
+        result = await session.execute(
+            sa_select(VoteParticipantModel).where(
+                VoteParticipantModel.vote_id == vote.id,
+                VoteParticipantModel.user_id == interaction.user.id,
+            )
+        )
+        participant = result.scalar_one_or_none()
+        if participant is None or not participant.has_voted:
+            await interaction.followup.send("\u274c У вас нет голоса для отзыва.", ephemeral=True)
+            return
+
+        await voting.revoke_vote(session, vote, interaction.user.id)
+        _multi_selections.pop((vote_id, interaction.user.id), None)
+
+        await audit.log_action(
+            session,
+            action="vote_revoked",
+            guild_id=vote.guild_id,
+            vote_id=vote.id,
+            user_id=interaction.user.id,
+            user_name=interaction.user.display_name,
+        )
+
+        await session.commit()
+        try:
+            await voting.refresh_vote_messages(session, vote, interaction.client)
+        except Exception:
+            logger.warning(
+                "Не удалось обновить сообщения голосования %s после отзова",
+                vote_id, exc_info=True,
+            )
+
+    await interaction.followup.send(
+        "\U0001f5f3\ufe0f Голос отозван. Повторное голосование недоступно.",
+        ephemeral=True,
     )
-    m = _COUNCIL_NUMBER_RE.search(name)
-    if not m:
-        return None
-    token = m.group(1)
-    if token.isdigit():
-        return int(token)
-    return _ROMAN_TO_INT.get(token.upper())
+
+
+def _veto_direction_view(vote_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=300)
+    for direction, label, style, emoji in (
+        ("reject", "Отклонить инициативу", discord.ButtonStyle.danger, "\u274c"),
+        ("confirm", "Одобрить инициативу", discord.ButtonStyle.success, "\u2705"),
+    ):
+        btn = discord.ui.Button(
+            label=label,
+            custom_id=f"vdir_{vote_id}_{direction}",
+            style=style,
+            emoji=emoji,
+        )
+        view.add_item(btn)
+    return view
+
+
+class _VetoModal(discord.ui.Modal):
+    def __init__(self, vote_id: int, direction: str):
+        title = (
+            "Вето: отклонить" if direction == "reject" else "Вето: одобрить"
+        )
+        super().__init__(title=title, timeout=300)
+        self.vote_id = vote_id
+        self.direction = direction
+        self.reason_input = discord.ui.TextInput(
+            label="Причина вето",
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+            required=True,
+        )
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await _execute_veto(
+            interaction, self.vote_id, str(self.reason_input.value), self.direction
+        )
+
+
+async def _handle_button_veto(interaction: discord.Interaction, vote_id: int) -> None:
+    if interaction.guild_id is None:
+        await interaction.response.send_message("\u274c Только на сервере.", ephemeral=True)
+        return
+
+    council_num = _parse_council_number(interaction.user.display_name)
+    if council_num is None:
+        await interaction.response.send_message(
+            "\u274c Вы не член Совета (нет О5-X в нике).", ephemeral=True
+        )
+        return
+
+    async with get_session() as session:
+        vote = await voting.get_vote_by_id(session, vote_id, interaction.guild_id)
+        if not vote:
+            await interaction.response.send_message(
+                "\u274c Голосование не найдено.", ephemeral=True
+            )
+            return
+        if vote.status not in ("open", "paused"):
+            await interaction.response.send_message(
+                "\u274c Голосование не активно.", ephemeral=True
+            )
+            return
+        veto_level = await voting.get_user_veto_level(
+            session, interaction.guild_id, interaction.user.id
+        )
+
+    if veto_level is None:
+        await interaction.response.send_message(
+            "\u274c У вас нет права ВЕТО.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"\U0001f6d1 **Вето на голосование #{vote.vote_number}** — выберите направление:",
+        view=_veto_direction_view(vote_id),
+        ephemeral=True,
+    )
+
+
+async def _handle_button_veto_direction(
+    interaction: discord.Interaction, vote_id: int, direction: str
+) -> None:
+    await interaction.response.send_modal(_VetoModal(vote_id, direction))
+
+
+async def _execute_veto(
+    interaction: discord.Interaction, vote_id: int, reason: str, direction: str
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    async with get_session() as session:
+        vote = await voting.get_vote_by_id(session, vote_id, interaction.guild_id)
+        if not vote:
+            await interaction.followup.send("\u274c Голосование не найдено.", ephemeral=True)
+            return
+        if vote.status not in ("open", "paused"):
+            await interaction.followup.send("\u274c Голосование не активно.", ephemeral=True)
+            return
+
+        res = await voting.apply_veto(
+            session, vote, interaction.user.id, reason,
+            user_name=interaction.user.display_name, direction=direction,
+        )
+        if res is None:
+            await interaction.followup.send(
+                "\u274c У вас нет права ВЕТО.", ephemeral=True
+            )
+            return
+
+        await session.commit()
+        try:
+            await voting.refresh_vote_messages(session, vote, interaction.client)
+        except Exception:
+            logger.warning(
+                "Не удалось обновить сообщения голосования %s после вето",
+                vote_id, exc_info=True,
+            )
+
+    await interaction.followup.send(
+        f"\u2705 Вето **{res['roman']}** уровня наложено на голосование #{vote.vote_number}\n"
+        f"**Направление:** {res['dir_text']}\n"
+        f"**Причина:** {reason}\n"
+        f"Голосование завершено.",
+        ephemeral=True,
+    )
 
 
 async def _iter_role_members(guild: discord.Guild, role: discord.Role):
@@ -2179,8 +2383,7 @@ async def _check_council_or_admin_permission(
 @tasks.loop(minutes=1)
 async def auto_close_task() -> None:
     try:
-        from sqlalchemy import select as sa_select, text
-        from sqlalchemy.orm import selectinload
+        from sqlalchemy import select as sa_select
         from bot.models.models import Vote as VoteModel
 
         async with get_session() as session:
@@ -2209,30 +2412,16 @@ async def auto_close_task() -> None:
                     user_name="Система",
                 )
 
-                try:
-                    if not (vote.message_id and vote.channel_id):
-                        continue
-                    result2 = await session.execute(
-                        sa_select(VoteModel)
-                        .where(VoteModel.id == vote.id)
-                        .options(selectinload(VoteModel.options), selectinload(VoteModel.participants))
-                    )
-                    fresh_vote = result2.scalar_one()
-                    from bot.utils.embeds import build_completed_embed
-                    embed = await build_completed_embed(fresh_vote, session)
-                    targets = await voting.get_vote_message_targets(session, vote)
-                    for ch_id, msg_id in targets:
-                        try:
-                            channel = bot.get_channel(ch_id)
-                            if channel:
-                                msg = await channel.fetch_message(msg_id)
-                                await msg.edit(embed=embed, view=None)
-                        except Exception as e:
-                            logger.warning("Не удалось обновить сообщение %s: %s", msg_id, e)
-                except Exception as e:
-                    logger.warning("Не удалось обновить сообщение %s: %s", vote.message_id, e)
-
             await session.commit()
+
+            for vote in expired_votes:
+                try:
+                    await voting.refresh_vote_messages(session, vote, bot)
+                except Exception:
+                    logger.warning(
+                        "auto_close: не удалось обновить сообщения голосования %s",
+                        vote.id, exc_info=True,
+                    )
     except Exception as e:
         logger.error("Ошибка в auto_close_task: %s", e)
 
@@ -2640,6 +2829,93 @@ class AdminPanelModal(discord.ui.Modal, title="Панель администра
             "\u2753 Неизвестная команда панели администратора.",
             ephemeral=True,
         )
+
+
+@bot.tree.command(name="audit", description="Журнал действий (аудит)")
+@app_commands.describe(
+    limit="Сколько записей показать (по умолчанию 20, максимум 100)",
+    action="Фильтр по типу действия",
+    vote_id="Показать журнал конкретного голосования",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name=title, value=key)
+        for key, (title, _color) in audit._ACTION_META.items()
+    ]
+)
+async def audit_command(
+    interaction: discord.Interaction,
+    limit: int = 20,
+    action: str | None = None,
+    vote_id: int | None = None,
+) -> None:
+    if not await _check_admin_permission(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    limit = max(1, min(limit, 100))
+
+    async with get_session() as session:
+        if vote_id is not None:
+            vote = await voting.get_vote_by_id(session, vote_id, interaction.guild_id)
+            if not vote:
+                await interaction.followup.send("\u274c Голосование не найдено.", ephemeral=True)
+                return
+            logs = await audit.get_vote_logs(session, vote.id, limit=limit)
+        else:
+            logs = await audit.get_guild_logs(
+                session, interaction.guild_id, limit=limit, action_filter=action
+            )
+
+        if not logs:
+            await interaction.followup.send("\u2139\ufe0f Журнал пуст.", ephemeral=True)
+            return
+
+        lines = []
+        for entry in logs:
+            title = audit._ACTION_META.get(entry.action, (f"\u2139\ufe0f {entry.action}", 0x5865F2))[0]
+            when = entry.created_at.strftime("%d.%m.%Y %H:%M") if entry.created_at else "—"
+            who = entry.user_name or str(entry.user_id)
+            line = f"`{when}` {title} — **{who}**"
+            details_text = audit._format_details(entry.details)
+            if details_text:
+                line += f" — {details_text}"
+            if entry.vote_id:
+                line += f" · голосование `{entry.vote_id}`"
+            lines.append(line)
+
+    # Нарезка на страницы по лимиту Discord embed (4096 символов)
+    pages: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in lines:
+        if size + len(line) + 1 > 3900:
+            pages.append("\n".join(current))
+            current = []
+            size = 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        pages.append("\n".join(current))
+
+    title = "── Журнал аудита ──"
+    if vote_id is not None:
+        title = f"── Журнал аудита · голосование #{vote_id} ──"
+    elif action:
+        title = f"── Журнал аудита · {action} ──"
+
+    for i, page in enumerate(pages[:5]):
+        embed = discord.Embed(
+            title=title if len(pages) == 1 else f"{title} ({i + 1}/{len(pages)})",
+            description=page,
+            color=0x5865F2,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        if i == 0 and len(pages) > 5:
+            await interaction.followup.send(
+                "\u26a0\ufe0f Показаны только первые 5 страниц.", ephemeral=True
+            )
+            break
 
 
 @bot.tree.command(name="a-panel", description="Панель администратора бота (требуется код доступа)")

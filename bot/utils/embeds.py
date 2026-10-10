@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
+import unicodedata
 from typing import TYPE_CHECKING
 
 import discord
@@ -51,6 +53,12 @@ _TYPE_TEXT = {
     "multi_choice": "Множественный выбор",
     "ranked": "Рейтинговое",
     "weighted": "С весами",
+}
+
+_CHANGE_MODE_TEXT = {
+    "change": "Изменение",
+    "revoke": "Отзыв",
+    "none": "Нет",
 }
 
 _ANONYMITY_TEXT = {
@@ -115,7 +123,7 @@ async def build_vote_embed(vote: "Vote", show_results: bool = True, session: "As
 
     # ── Parameters ──
     abstain = "Разрешено" if vote.vote_type == "standard" else "Запрещено"
-    change = "Разрешено" if vote.change_mode in ("change", "revoke") else "Запрещено"
+    change = _CHANGE_MODE_TEXT.get(vote.change_mode, vote.change_mode)
     mandatory = "Да" if vote.is_mandatory else "Нет"
 
     params = (
@@ -125,7 +133,8 @@ async def build_vote_embed(vote: "Vote", show_results: bool = True, session: "As
         f"  Изменение   {change}\n"
         f"  Обязат.     {mandatory}\n"
         f"  Воздержание {abstain}\n"
-        f"```"
+        + (f"  Лимит       до {vote.max_multi_choices} вариант(ов)\n" if vote.vote_type == "multi_choice" else "")
+        + f"```"
     )
     embed.add_field(name="── Параметры ──", value=params, inline=False)
 
@@ -136,34 +145,33 @@ async def build_vote_embed(vote: "Vote", show_results: bool = True, session: "As
             value="```ansi\n" + _results_ansi(vote.result_data) + "\n```",
             inline=False,
         )
-    elif vote.status == "open":
+    elif vote.status in ("open", "paused"):
         if session is not None:
-            from sqlalchemy import func as sa_func
-            from sqlalchemy import select as sa_select
+            from bot.services.voting import compute_live_tally
 
-            from bot.models.models import VoteParticipant
-
-            total_voted = (
-                await session.execute(
-                    sa_select(sa_func.count())
-                    .select_from(VoteParticipant)
-                    .where(
-                        VoteParticipant.vote_id == vote.id,
-                        VoteParticipant.has_voted == True,  # noqa: E712
-                    )
+            tally = await compute_live_tally(session, vote)
+            threshold = max(1, vote.min_votes_for_results or 0)
+            if vote.show_results_immediately and tally["total_voted"] >= threshold:
+                embed.add_field(
+                    name="── Текущие итоги ──",
+                    value="```ansi\n"
+                    + _results_ansi(tally, show_percentages=bool(vote.show_percentages))
+                    + "\n```",
+                    inline=False,
                 )
-            ).scalar() or 0
-            from bot.services.voting import count_eligible_voters
-
-            total_eligible = await count_eligible_voters(session, vote)
+            else:
+                embed.add_field(
+                    name="── Проголосовало ──",
+                    value=f"```ansi\n  \x1b[32m{tally['total_voted']}\x1b[0m из {tally['total_eligible']} участников\n```",
+                    inline=False,
+                )
         else:
-            total_voted = len([p for p in (vote.participants or []) if p.has_voted])
-            total_eligible = 0
-        embed.add_field(
-            name="── Проголосовало ──",
-            value=f"```ansi\n  \x1b[32m{total_voted}\x1b[0m из {total_eligible} участников\n```",
-            inline=False,
-        )
+            voted_count = len([p for p in (vote.participants or []) if p.has_voted])
+            embed.add_field(
+                name="── Проголосовало ──",
+                value=f"```ansi\n  \x1b[32m{voted_count}\x1b[0m из 0 участников\n```",
+                inline=False,
+            )
 
     # ── Author + deadline (normal text, not ANSI) ──
     meta_parts = []
@@ -186,7 +194,7 @@ async def build_vote_embed(vote: "Vote", show_results: bool = True, session: "As
 # ---------------------------------------------------------------------------
 
 
-def _results_ansi(data: dict, show_winner: bool = False) -> str:
+def _results_ansi(data: dict, show_winner: bool = False, show_percentages: bool = True) -> str:
     lines = []
     winner_label = data.get("winner") if show_winner else None
 
@@ -200,19 +208,24 @@ def _results_ansi(data: dict, show_winner: bool = False) -> str:
         bar = _bar(pct / 100, ck)
 
         marker = f"  \x1b[32m◆\x1b[0m" if label == winner_label else ""
+        pct_part = f"  {pct:>5.1f}%" if show_percentages else ""
+        count_txt = str(int(count)) if float(count).is_integer() else str(count)
         lines.append(
             f"\x1b[1m{label:<14}\x1b[0m "
-            f"{bar}  {pct:>5.1f}%  {count}{marker}"
+            f"{bar}{pct_part}  {count_txt}{marker}"
         )
 
     total_voted = data.get("total_voted", 0)
     total_eligible = data.get("total_eligible", 0)
     turnout = data.get("turnout_percent", 0)
     lines.append("")
-    lines.append(
-        f"\x1b[90mПроголосовало: {total_voted} из {total_eligible}"
-        f"  │  Явка: {turnout:.1f}%\x1b[0m"
-    )
+    if show_percentages:
+        lines.append(
+            f"\x1b[90mПроголосовало: {total_voted} из {total_eligible}"
+            f"  │  Явка: {turnout:.1f}%\x1b[0m"
+        )
+    else:
+        lines.append(f"\x1b[90mПроголосовало: {total_voted} из {total_eligible}\x1b[0m")
     return "\n".join(lines)
 
 
@@ -222,17 +235,23 @@ def _results_ansi(data: dict, show_winner: bool = False) -> str:
 
 
 async def build_completed_embed(vote: "Vote", session: "AsyncSession | None" = None) -> discord.Embed:
-    sym = _STATUS_SYMBOL.get("completed", "◆")
+    sym = _STATUS_SYMBOL.get(vote.status, "◆")
+    stxt = _STATUS_TEXT.get(vote.status, "Завершено").upper()
 
     desc = []
     desc.append(f"{'━' * 48}")
-    desc.append(f"  {sym}  ГОЛОСОВАНИЕ №{vote.vote_number}  ┃  ЗАВЕРШЕНО")
+    desc.append(f"  {sym}  ГОЛОСОВАНИЕ №{vote.vote_number}  ┃  {stxt}")
     desc.append(f"{'━' * 48}")
     desc.append("")
     desc.append(f"```text\n{vote.title}\n```")
 
-    if vote.completion_reason:
-        desc.append(f"```ansi\n\x1b[37mПричина: {vote.completion_reason[:300]}\x1b[0m\n```")
+    reason = (
+        vote.cancel_reason
+        if vote.status == "cancelled"
+        else vote.completion_reason
+    )
+    if reason:
+        desc.append(f"```ansi\n\x1b[37mПричина: {reason[:300]}\x1b[0m\n```")
 
     embed = discord.Embed(description="\n".join(desc), color=0x2B2D31)
 
@@ -245,7 +264,7 @@ async def build_completed_embed(vote: "Vote", session: "AsyncSession | None" = N
         )
 
     # ── Council table (ANSI) ──
-    if vote.anonymity_level == "open" and session is not None:
+    if vote.anonymity_level == "open" and vote.show_voter_list and session is not None:
         table = await _build_council_table(session, vote)
         if table:
             embed.add_field(
@@ -297,11 +316,85 @@ async def build_completed_embed(vote: "Vote", session: "AsyncSession | None" = N
 # Council table
 # ---------------------------------------------------------------------------
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+# Диапазоны декоративных символов, которые разные шрифты рисуют с разной
+# шириной (ломают выравнивание моноширинной таблицы) — вырезаем их из ников.
+_DROP_SYMBOL_RANGES = (
+    (0x2500, 0x257F),   # Box Drawing
+    (0x2580, 0x259F),   # Block Elements
+    (0x25A0, 0x25FF),   # Geometric Shapes
+    (0x2600, 0x26FF),   # Miscellaneous Symbols
+    (0x2700, 0x27BF),   # Dingbats
+    (0x2B00, 0x2BFF),   # Miscellaneous Symbols and Arrows
+)
+
+_ZERO_WIDTH = frozenset({0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x2060, 0xFEFF})
+
+
+def _is_dropped_symbol(cp: int) -> bool:
+    return any(lo <= cp <= hi for lo, hi in _DROP_SYMBOL_RANGES)
+
+
+def _char_width(ch: str) -> int:
+    """Ширина символа в клетках моноширинного шрифта."""
+    cp = ord(ch)
+    if cp in _ZERO_WIDTH:
+        return 0
+    cat = unicodedata.category(ch)
+    if cat in ("Mn", "Me", "Cf", "Cc"):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def _display_width(text: str) -> int:
+    """Видимая ширина строки (ANSI-коды и zero-width не учитываются)."""
+    return sum(_char_width(ch) for ch in _ANSI_RE.sub("", text))
+
+
+def _truncate_width(text: str, limit: int) -> str:
+    """Обрезает строку по видимой ширине, не разрывая комбинирующиеся символы."""
+    if limit <= 0:
+        return ""
+    if _display_width(text) <= limit:
+        return text
+    budget = limit - 1
+    out: list[str] = []
+    width = 0
+    for ch in text:
+        w = _char_width(ch)
+        if w == 0:
+            out.append(ch)
+            continue
+        if width + w > budget:
+            break
+        out.append(ch)
+        width += w
+    return "".join(out).rstrip() + "…"
+
+
+def _sanitize_name(text: str) -> str:
+    """Нормализует отображаемое имя: убирает «фэнси»-шрифты, zalgo, служебные
+    и разной ширины декоративные символы, чтобы ники не ломали моноширинную
+    таблицу и не подделывали текст."""
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKC", text)
+    kept: list[str] = []
+    for ch in normalized:
+        if unicodedata.category(ch) in ("Mn", "Me", "Cf", "Cc", "Cs", "Co", "Cn"):
+            continue
+        if _is_dropped_symbol(ord(ch)):
+            continue
+        kept.append(ch)
+    return re.sub(r"\s+", " ", "".join(kept)).strip()
+
 
 def _center_cell(text: str, width: int, color: str | None = None) -> str:
-    if len(text) > width:
-        text = text[: width - 1] + "…" if width >= 1 else ""
-    pad = width - len(text)
+    text = _truncate_width(text, width)
+    pad = max(0, width - _display_width(text))
     left = pad // 2
     right = pad - left
     if color:
@@ -318,10 +411,13 @@ def _box_table(headers: list[str], columns: list[list[str]], colors: list[str | 
     for c in cols:
         c.extend([""] * (rows - len(c)))
 
-    min_w = [len(h) + 2 for h in headers]
+    min_w = [_display_width(h) + 2 for h in headers]
 
     def widths(cs: list[list[str]]) -> list[int]:
-        return [max(min_w[i], max((len(x) for x in cs[i]), default=0) + 2) for i in range(n)]
+        return [
+            max(min_w[i], max((_display_width(x) for x in cs[i]), default=0) + 2)
+            for i in range(n)
+        ]
 
     def total_chars(w: list[int], r: int) -> int:
         s = sum(w)
@@ -351,10 +447,7 @@ def _box_table(headers: list[str], columns: list[list[str]], colors: list[str | 
     # ── 3) Урезаем ячейки под итоговые ширины ──
     for i in range(n):
         limit = w[i] - 2
-        cols[i] = [
-            s if len(s) <= limit else (s[: limit - 1] + "…") if limit >= 1 else ""
-            for s in cols[i]
-        ]
+        cols[i] = [_truncate_width(s, limit) for s in cols[i]]
 
     top = "┌" + "┬".join("─" * x for x in w) + "┐"
     sep = "├" + "┼".join("─" * x for x in w) + "┤"
@@ -372,6 +465,7 @@ async def _build_council_table(session: "AsyncSession", vote: "Vote") -> str:
     from sqlalchemy import select
 
     from bot.models import CouncilMember, VoteParticipant, VoteOption
+    from bot.utils.council import parse_council_number
 
     members_result = await session.execute(
         select(CouncilMember)
@@ -397,7 +491,7 @@ async def _build_council_table(session: "AsyncSession", vote: "Vote") -> str:
     options = list(options_result.scalars().all())
 
     if options:
-        headers = [o.label for o in options]
+        headers = [_sanitize_name(o.label) or o.label for o in options]
         id_to_col = {o.id: i for i, o in enumerate(options)}
     else:
         headers = ["ЗА", "ПРОТИВ", "ВОЗДЕРЖАЛСЯ"]
@@ -406,16 +500,20 @@ async def _build_council_table(session: "AsyncSession", vote: "Vote") -> str:
     columns: list[list[str]] = [[] for _ in headers]
 
     for m in members:
-        if m.council_number is not None:
-            label = f"О5-{m.council_number}"
-        else:
-            label = m.display_name or "—"
+        number = m.council_number
+        if number is None:
+            number = parse_council_number(m.display_name or "")
+        label = f"О5-{number}" if number is not None else "О5-?"
 
         participant = votes_by_user.get(m.user_id)
-        if participant and participant.option_id is not None:
-            idx = id_to_col.get(participant.option_id)
-            if idx is not None:
-                columns[idx].append(label)
+        if participant and participant.has_voted:
+            p_ids = participant.option_ids or (
+                [participant.option_id] if participant.option_id is not None else []
+            )
+            for oid in p_ids:
+                idx = id_to_col.get(oid)
+                if idx is not None:
+                    columns[idx].append(label)
 
     if all(not c for c in columns):
         columns = [["-" for _ in headers]]
@@ -455,28 +553,62 @@ def build_vote_buttons(vote: "Vote") -> list[discord.ui.Button]:
     return buttons
 
 
-def build_admin_buttons(vote: "Vote") -> list[discord.ui.Button]:
-    row1 = []
-    if vote.status == "open":
-        row1.append(discord.ui.Button(
-            label="Приостановить",
-            custom_id=f"admin_pause_{vote.id}",
-            style=discord.ButtonStyle.secondary,
-        ))
-        row1.append(discord.ui.Button(
-            label="Завершить",
-            custom_id=f"admin_complete_{vote.id}",
-            style=discord.ButtonStyle.danger,
-        ))
-    elif vote.status == "paused":
-        row1.append(discord.ui.Button(
-            label="Возобновить",
-            custom_id=f"admin_resume_{vote.id}",
+def build_vote_view(vote: "Vote") -> discord.ui.View | None:
+    """Вью для опубликованного сообщения голосования.
+
+    Кнопки ставятся только на primary-сообщение; копии в других каналах
+    остаются embed-only (см. publish в bot.py и refresh_vote_messages).
+    """
+    if vote.status != "open":
+        return None
+    view = discord.ui.View(timeout=None)
+
+    if vote.vote_type == "multi_choice":
+        option_buttons = []
+        for i, opt in enumerate((vote.options or [])[:15]):
+            btn = discord.ui.Button(
+                label=opt.label,
+                custom_id=f"mv_{vote.id}_{opt.id}",
+                style=discord.ButtonStyle.primary,
+            )
+            btn.row = i // 5
+            option_buttons.append(btn)
+        for btn in option_buttons:
+            view.add_item(btn)
+        next_row = (len(option_buttons) - 1) // 5 + 1 if option_buttons else 0
+        confirm_btn = discord.ui.Button(
+            label="Подтвердить выбор",
+            custom_id=f"mvok_{vote.id}",
             style=discord.ButtonStyle.success,
-        ))
-        row1.append(discord.ui.Button(
-            label="Завершить",
-            custom_id=f"admin_complete_{vote.id}",
-            style=discord.ButtonStyle.danger,
-        ))
-    return row1
+            emoji="\u2705",
+        )
+        confirm_btn.row = next_row
+        view.add_item(confirm_btn)
+        utility_row = next_row + 1
+    else:
+        option_buttons = build_vote_buttons(vote)[:15]
+        for i, btn in enumerate(option_buttons):
+            btn.row = i // 5
+            view.add_item(btn)
+        next_row = (len(option_buttons) - 1) // 5 + 1 if option_buttons else 0
+        utility_row = next_row
+
+    if vote.change_mode == "revoke":
+        revoke_btn = discord.ui.Button(
+            label="Отозвать мой голос",
+            custom_id=f"vrevoke_{vote.id}",
+            style=discord.ButtonStyle.secondary,
+            emoji="\U0001f5d1\ufe0f",
+        )
+        revoke_btn.row = utility_row
+        view.add_item(revoke_btn)
+    veto_btn = discord.ui.Button(
+        label="ВЕТО",
+        custom_id=f"veto_{vote.id}",
+        style=discord.ButtonStyle.danger,
+        emoji="\U0001f6d1",
+    )
+    veto_btn.row = utility_row
+    view.add_item(veto_btn)
+    return view
+

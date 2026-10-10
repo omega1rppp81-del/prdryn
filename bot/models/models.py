@@ -329,8 +329,10 @@ class VoteParticipant(Base, TimestampMixin):
         ForeignKey("vote_options.id"),
         nullable=True,
     )
+    option_ids: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     has_voted: Mapped[bool] = mapped_column(Boolean, default=False)
     voted_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
+    revoked_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
     weight: Mapped[float] = mapped_column(Float, default=1.0)
     change_count: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)

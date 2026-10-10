@@ -25,6 +25,7 @@ _ACTION_META = {
     "paused": ("\u23f8\ufe0f Голосование приостановлено", 0xFEE75C),
     "resumed": ("\u25b6\ufe0f Голосование возобновлено", 0x57F287),
     "veto_cast": ("\U0001f6d1 Наложено вето", 0xED4245),
+    "vote_revoked": ("\U0001f5f3\ufe0f Голос отозван", 0xFEE75C),
     "reminder_sent": ("\U0001f514 Отправлено напоминание", 0x5865F2),
     "draft_edited": ("\u270f\ufe0f Черновик изменён", 0x5865F2),
     "settings_changed": ("\u2699\ufe0f Настройки изменены", 0x5865F2),

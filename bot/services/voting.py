@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import re
 from typing import Optional
 
@@ -18,6 +19,8 @@ from bot.models import (
     VoteParticipant,
     VoteStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def get_or_create_guild_settings(session: AsyncSession, guild_id: int) -> GuildSettings:
@@ -110,6 +113,53 @@ async def get_vote_message_targets(
     return list(pairs)
 
 
+async def refresh_vote_messages(
+    session: AsyncSession,
+    vote: Vote,
+    client,
+) -> int:
+    """Перерисовать все опубликованные сообщения голосования по текущему статусу.
+
+    Primary-сообщение получает кнопки только пока статус open; копии в других
+    каналах остаются embed-only. Возвращает число обновлённых сообщений.
+    """
+    from bot.utils.embeds import build_completed_embed, build_vote_embed, build_vote_view
+
+    result = await session.execute(
+        select(Vote)
+        .where(Vote.id == vote.id)
+        .options(selectinload(Vote.options), selectinload(Vote.participants))
+    )
+    fresh = result.scalar_one()
+
+    if fresh.status in (VoteStatus.OPEN, VoteStatus.PAUSED):
+        embed = await build_vote_embed(fresh, session=session)
+        view = build_vote_view(fresh)
+    else:
+        embed = await build_completed_embed(fresh, session)
+        view = None
+
+    updated = 0
+    for ch_id, msg_id in await get_vote_message_targets(session, fresh):
+        try:
+            ch = client.get_channel(ch_id)
+            if ch is None:
+                ch = await client.fetch_channel(ch_id)
+            msg = await ch.fetch_message(msg_id)
+            is_primary = fresh.channel_id == ch_id and fresh.message_id == msg_id
+            if is_primary:
+                await msg.edit(embed=embed, view=view)
+            else:
+                await msg.edit(embed=embed)
+            updated += 1
+        except Exception:
+            logger.warning(
+                "refresh_vote_messages: не удалось обновить сообщение %s (канал %s) голосования %s",
+                msg_id, ch_id, fresh.id, exc_info=True,
+            )
+    return updated
+
+
 async def get_next_vote_number(session: AsyncSession, guild_id: int) -> int:
     settings_obj = await get_or_create_guild_settings(session, guild_id)
     num = settings_obj.next_vote_number
@@ -137,6 +187,7 @@ async def create_vote(
     majority_rule: str = "simple",
     tie_rule: str = "not_accepted",
     custom_options: list[str] | None = None,
+    max_multi_choices: int | None = None,
     starts_at: dt.datetime | None = None,
     ends_at: dt.datetime | None = None,
     allow_early_end: bool = True,
@@ -174,6 +225,7 @@ async def create_vote(
         allow_early_end=allow_early_end,
         confirmation_required=confirmation_required,
         custom_options=custom_options,
+        max_multi_choices=max_multi_choices if vote_type == "multi_choice" else None,
         starts_at=starts_at,
         ends_at=ends_at,
         related_vote_id=related_vote_id,
@@ -183,6 +235,8 @@ async def create_vote(
     await session.flush()
 
     default_options = _get_default_options(vote_type)
+    if not default_options and not custom_options:
+        default_options = ["Вариант 1", "Вариант 2", "Вариант 3"]
     for i, label in enumerate(default_options):
         opt = VoteOption(vote_id=vote.id, label=label, position=i)
         session.add(opt)
@@ -286,10 +340,24 @@ async def cast_vote(
     session: AsyncSession,
     vote: Vote,
     user_id: int,
-    option_id: int,
+    option_id: int | None,
     user_name: str | None = None,
     weight: float = 1.0,
+    option_ids: list[int] | None = None,
 ) -> VoteParticipant:
+    if vote.vote_type == "multi_choice":
+        ids = list(option_ids) if option_ids else ([option_id] if option_id is not None else [])
+        if not ids:
+            raise ValueError("Выберите хотя бы один вариант")
+        if vote.max_multi_choices and len(ids) > vote.max_multi_choices:
+            raise ValueError(f"Можно выбрать не более {vote.max_multi_choices} вариантов")
+        option_ids = ids
+        option_id = ids[0]
+    else:
+        option_ids = None
+        if option_id is None:
+            raise ValueError("Вариант не выбран")
+
     existing = await session.execute(
         select(VoteParticipant).where(
             VoteParticipant.vote_id == vote.id,
@@ -306,6 +374,7 @@ async def cast_vote(
             user_id=user_id,
             user_name=user_name,
             option_id=option_id,
+            option_ids=option_ids,
             has_voted=True,
             voted_at=dt.datetime.now(dt.timezone.utc),
             weight=weight,
@@ -318,8 +387,10 @@ async def cast_vote(
             vote.participants.append(participant)
     else:
         participant.option_id = option_id
+        participant.option_ids = option_ids
         participant.has_voted = True
         participant.voted_at = dt.datetime.now(dt.timezone.utc)
+        participant.revoked_at = None
         participant.weight = weight
         participant.change_count += 1
 
@@ -361,8 +432,10 @@ async def revoke_vote(session: AsyncSession, vote: Vote, user_id: int) -> VotePa
     participant = result.scalar_one_or_none()
     if participant:
         participant.option_id = None
+        participant.option_ids = None
         participant.has_voted = False
         participant.voted_at = None
+        participant.revoked_at = dt.datetime.now(dt.timezone.utc)
         await session.flush()
     return participant
 
@@ -387,6 +460,61 @@ async def count_eligible_voters(session: AsyncSession, vote: Vote) -> int:
     return member_result.scalar() or 0
 
 
+def _participant_option_ids(p: VoteParticipant) -> list[int]:
+    if p.option_ids:
+        return [oid for oid in p.option_ids if oid is not None]
+    if p.option_id is not None:
+        return [p.option_id]
+    return []
+
+
+def _tally_options(options: list[VoteOption], participants: list[VoteParticipant]) -> list[dict]:
+    counts: dict[int, float] = {opt.id: 0.0 for opt in options}
+    for p in participants:
+        for oid in _participant_option_ids(p):
+            if oid in counts:
+                counts[oid] += p.weight or 0.0
+    option_results = []
+    for opt in options:
+        option_results.append({
+            "option_id": opt.id,
+            "label": opt.label,
+            "emoji": opt.emoji,
+            "count": counts[opt.id],
+            "percentage": 0.0,
+        })
+    return option_results
+
+
+async def compute_live_tally(session: AsyncSession, vote: Vote) -> dict:
+    """Текущие (неокончательные) итоги открытого голосования."""
+    options_result = await session.execute(
+        select(VoteOption).where(VoteOption.vote_id == vote.id).order_by(VoteOption.position)
+    )
+    options = list(options_result.scalars().all())
+    participants = list((await session.execute(
+        select(VoteParticipant).where(
+            VoteParticipant.vote_id == vote.id,
+            VoteParticipant.has_voted == True,
+        )
+    )).scalars().all())
+
+    total_voted = len(participants)
+    total_eligible = await count_eligible_voters(session, vote)
+    turnout = (total_voted / total_eligible * 100) if total_eligible > 0 else 0
+
+    option_results = _tally_options(options, participants)
+    for r in option_results:
+        r["percentage"] = (r["count"] / total_voted * 100) if total_voted > 0 else 0
+
+    return {
+        "options": option_results,
+        "total_voted": total_voted,
+        "total_eligible": total_eligible,
+        "turnout_percent": round(turnout, 1),
+    }
+
+
 async def calculate_results(session: AsyncSession, vote: Vote) -> dict:
     options_result = await session.execute(
         select(VoteOption).where(VoteOption.vote_id == vote.id).order_by(VoteOption.position)
@@ -407,18 +535,9 @@ async def calculate_results(session: AsyncSession, vote: Vote) -> dict:
 
     turnout = (total_voted / total_eligible * 100) if total_eligible > 0 else 0
 
-    option_results = []
-    for opt in options:
-        count = sum(
-            p.weight for p in participants if p.option_id == opt.id
-        )
-        option_results.append({
-            "option_id": opt.id,
-            "label": opt.label,
-            "emoji": opt.emoji,
-            "count": count,
-            "percentage": (count / total_voted * 100) if total_voted > 0 else 0,
-        })
+    option_results = _tally_options(options, participants)
+    for r in option_results:
+        r["percentage"] = (r["count"] / total_voted * 100) if total_voted > 0 else 0
 
     quorum_reached = _check_quorum(vote, total_voted, total_eligible)
     winner = _determine_winner(vote, option_results, total_voted, total_eligible)
@@ -525,8 +644,14 @@ async def check_user_can_vote(session: AsyncSession, vote: Vote, user_id: int) -
     )
     participant = existing.scalar_one_or_none()
 
-    if participant and participant.has_voted and vote.change_mode == "none":
-        return False, "Вы уже проголосовали. Изменение голоса запрещено"
+    if participant and participant.has_voted:
+        if vote.change_mode == "none":
+            return False, "Вы уже проголосовали. Изменение голоса запрещено"
+        if vote.change_mode == "revoke":
+            return False, "Прямое переключение запрещено — используйте кнопку «Отозвать мой голос»"
+
+    if participant and participant.revoked_at is not None and vote.change_mode == "revoke":
+        return False, "Вы отозвали свой голос — повторное голосование недоступно"
 
     return True, "OK"
 
@@ -866,6 +991,72 @@ async def cast_veto(
     session.add(veto)
     await session.flush()
     return veto
+
+
+async def get_user_veto_level(
+    session: AsyncSession, guild_id: int, user_id: int
+) -> int | None:
+    result = await session.execute(
+        select(CouncilMember).where(
+            CouncilMember.guild_id == guild_id,
+            CouncilMember.user_id == user_id,
+            CouncilMember.is_active == True,
+        )
+    )
+    member = result.scalar_one_or_none()
+    if member is None or member.veto_level is None:
+        return None
+    return member.veto_level
+
+
+async def apply_veto(
+    session: AsyncSession,
+    vote: Vote,
+    user_id: int,
+    reason: str,
+    user_name: str | None = None,
+    direction: str = "reject",
+) -> dict | None:
+    """Накладывает вето и завершает голосование.
+
+    Возвращает данные для ответа или None, если у пользователя нет прав вето.
+    """
+    from bot.services import audit
+
+    auto_level = await get_user_veto_level(session, vote.guild_id, user_id)
+    if auto_level is None:
+        return None
+
+    veto = await cast_veto(
+        session, vote.id, user_id, reason, user_name,
+        veto_level=auto_level, veto_direction=direction,
+    )
+    await calculate_results(session, vote)
+
+    roman = {1: "I", 2: "II", 3: "III"}.get(auto_level, str(auto_level))
+    dir_text = "отклонение" if direction == "reject" else "одобрение"
+    veto_reason = f"Вето {roman} ({dir_text}): {reason}"
+
+    await complete_vote(session, vote, reason=veto_reason)
+
+    await audit.log_action(
+        session,
+        action="veto_cast",
+        guild_id=vote.guild_id,
+        vote_id=vote.id,
+        user_id=user_id,
+        user_name=user_name,
+        details={"reason": reason, "level": auto_level, "direction": direction},
+    )
+
+    return {
+        "veto": veto,
+        "level": auto_level,
+        "roman": roman,
+        "dir_text": dir_text,
+        "direction": direction,
+        "reason": reason,
+    }
 
 
 async def resolve_veto(
