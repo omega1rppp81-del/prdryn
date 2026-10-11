@@ -89,9 +89,12 @@ class GuildSettings(Base, TimestampMixin):
     admin_channel_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     council_role_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    admin_role_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     auditor_role_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    chair_role_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+
+    # Veto roles by level (multiple roles supported per level)
+    veto_role_ids_level1: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    veto_role_ids_level2: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    veto_role_ids_level3: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
 
     timezone: Mapped[str] = mapped_column(String(64), default="Europe/Moscow")
     numbering_format: Mapped[str] = mapped_column(String(32), default="sequential")
@@ -223,6 +226,11 @@ class Vote(Base, TimestampMixin):
     max_multi_choices: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     weights: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     memento: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    veto_window_expires_at: Mapped[Optional[dt.datetime]] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    vetoed_at: Mapped[Optional[dt.datetime]] = mapped_column(UTCDateTime(), nullable=True)
 
     cancel_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     completion_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

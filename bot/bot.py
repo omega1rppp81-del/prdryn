@@ -289,7 +289,7 @@ class CreateVoteSetupView(discord.ui.View):
 
             channel_id = settings_obj.vote_channel_id or interaction.channel_id
 
-            from bot.utils.embeds import build_vote_embed, build_vote_view
+            from bot.utils.embeds import build_vote_embed, build_vote_view, build_veto_view
 
             embed = await build_vote_embed(vote, session=session)
             view = build_vote_view(vote)
@@ -321,10 +321,11 @@ class CreateVoteSetupView(discord.ui.View):
             is_primary = idx == 0
             ch_guild_id = getattr(getattr(ch, "guild", None), "id", interaction.guild_id)
             content = role_ping if ch_guild_id == interaction.guild_id else None
+            ch_view = view if is_primary else build_veto_view(vote, forwarded=True)
             msg = await ch.send(
                 content=content,
                 embed=embed,
-                view=view if is_primary else None,
+                view=ch_view,
             )
             if primary_message is None:
                 primary_message = msg
@@ -578,23 +579,7 @@ async def sync_members_command(interaction: discord.Interaction):
             if member.bot:
                 continue
             council_num = _parse_council_number(member.display_name)
-
-            veto_level = None
-            if council_num is not None:
-                if council_num == 0:
-                    veto_level = 1
-                elif council_num == 1:
-                    veto_level = 2
-                elif council_num == 13:
-                    veto_level = 3
-
-            has_chair = False
-            if settings_obj.chair_role_id:
-                chair_role = interaction.guild.get_role(settings_obj.chair_role_id)
-                if chair_role and chair_role in member.roles:
-                    has_chair = True
-            if has_chair:
-                veto_level = 1
+            veto_level = _veto_level_from_roles(settings_obj, member.roles)
 
             members_data.append({
                 "user_id": member.id,
@@ -619,8 +604,9 @@ async def sync_members_command(interaction: discord.Interaction):
     vote_channel="Канал для публикации голосований",
     log_channel="Канал для журнала",
     council_role="Роль Совета",
-    admin_role="Роль администраторов",
-    chair_role="Роль председателя (для ВЕТО II уровня)",
+    veto_role_1="Роли ВЕТО 1 уровня (через запятую)",
+    veto_role_2="Роли ВЕТО 2 уровня (через запятую)",
+    veto_role_3="Роли ВЕТО 3 уровня (через запятую)",
     extra_vote_channels="Дополнительные каналы для дублирования (через запятую)",
     timezone="Часовой пояс",
 )
@@ -629,8 +615,9 @@ async def configure_command(
     vote_channel: discord.TextChannel | None = None,
     log_channel: discord.TextChannel | None = None,
     council_role: discord.Role | None = None,
-    admin_role: discord.Role | None = None,
-    chair_role: discord.Role | None = None,
+    veto_role_1: str | None = None,
+    veto_role_2: str | None = None,
+    veto_role_3: str | None = None,
     extra_vote_channels: str | None = None,
     timezone: str | None = None,
 ):
@@ -643,6 +630,15 @@ async def configure_command(
         settings_obj = await voting.get_or_create_guild_settings(session, interaction.guild_id)
 
         changes = {}
+
+        def _parse_roles(raw: str | None) -> list[int]:
+            ids = []
+            for part in (raw or "").split(","):
+                rid = _resolve_role_id(interaction, part)
+                if rid is not None and rid not in ids:
+                    ids.append(rid)
+            return ids
+
         if vote_channel:
             settings_obj.vote_channel_id = vote_channel.id
             changes["vote_channel"] = vote_channel.mention
@@ -652,12 +648,17 @@ async def configure_command(
         if council_role:
             settings_obj.council_role_id = council_role.id
             changes["council_role"] = council_role.mention
-        if admin_role:
-            settings_obj.admin_role_id = admin_role.id
-            changes["admin_role"] = admin_role.mention
-        if chair_role:
-            settings_obj.chair_role_id = chair_role.id
-            changes["chair_role"] = chair_role.mention
+        for level, attr in (
+            (1, "veto_role_ids_level1"),
+            (2, "veto_role_ids_level2"),
+            (3, "veto_role_ids_level3"),
+        ):
+            raw = {1: veto_role_1, 2: veto_role_2, 3: veto_role_3}[level]
+            if raw is None or not raw.strip():
+                continue
+            ids = _parse_roles(raw)
+            setattr(settings_obj, attr, ids)
+            changes[f"veto_role_{level}"] = ", ".join(f"<@&{i}>" for i in ids) or "—"
         if extra_vote_channels is not None and extra_vote_channels.strip():
             parsed_ids = []
             for part in extra_vote_channels.split(","):
@@ -678,6 +679,10 @@ async def configure_command(
             settings_obj.timezone = timezone
             changes["timezone"] = timezone
 
+        def _fmt_roles(attr: str) -> str:
+            ids = getattr(settings_obj, attr) or []
+            return ", ".join(f"<@&{i}>" for i in ids) or "—"
+
         if not changes:
             await interaction.followup.send(
                 "\u2139\ufe0f Текущие настройки:\n"
@@ -685,8 +690,9 @@ async def configure_command(
                 f"Доп. каналы (дублирование): {', '.join(_channel_label(interaction, cid) for cid in (settings_obj.extra_vote_channel_ids or [])) or '—'}\n"
                 f"Канал журнала: <#{settings_obj.log_channel_id}>\n"
                 f"Роль Совета: <@&{settings_obj.council_role_id}>\n"
-                f"Роль администраторов: <@&{settings_obj.admin_role_id}>\n"
-                f"Роль председателя: <@&{settings_obj.chair_role_id}>\n"
+                f"ВЕТО 1 уровня: {_fmt_roles('veto_role_ids_level1')}\n"
+                f"ВЕТО 2 уровня: {_fmt_roles('veto_role_ids_level2')}\n"
+                f"ВЕТО 3 уровня: {_fmt_roles('veto_role_ids_level3')}\n"
                 f"Часовой пояс: {settings_obj.timezone}",
                 ephemeral=True,
             )
@@ -1158,25 +1164,38 @@ async def vote_veto_command(
             await interaction.followup.send("\u274c Голосование не найдено.", ephemeral=True)
             return
 
-        if vote.status not in ("open", "paused"):
+        now = dt.datetime.now(dt.timezone.utc)
+        window_open = (
+            vote.veto_window_expires_at is not None
+            and now <= vote.veto_window_expires_at
+            and vote.status != VoteStatus.CANCELLED
+        )
+        if vote.status not in ("open", "paused") and not window_open:
             await interaction.followup.send("\u274c Голосование не активно.", ephemeral=True)
             return
 
-        council_num = _parse_council_number(interaction.user.display_name)
-        if council_num is None:
+        member_roles = [r.id for r in interaction.user.roles] if interaction.user and interaction.guild else []
+        veto_level = await voting.get_user_veto_level(
+            session, interaction.guild_id, interaction.user.id, member_roles=member_roles
+        )
+        if veto_level is None:
             await interaction.followup.send(
-                "\u274c Вы не член Совета (нет О5-X в нике).", ephemeral=True
+                "\u274c У вас нет права ВЕТО.", ephemeral=True
             )
             return
 
         res = await voting.apply_veto(
             session, vote, interaction.user.id, reason,
             user_name=interaction.user.display_name, direction=direction,
+            veto_level=veto_level,
         )
         if res is None:
             await interaction.followup.send(
                 "\u274c У вас нет права ВЕТО.", ephemeral=True
             )
+            return
+        if "error" in res:
+            await interaction.followup.send(res["error"], ephemeral=True)
             return
 
         await session.commit()
@@ -1186,7 +1205,7 @@ async def vote_veto_command(
         f"\u2705 Вето **{res['roman']}** уровня наложено на голосование #{vote.vote_number}\n"
         f"**Направление:** {res['dir_text']}\n"
         f"**Причина:** {reason}\n"
-        f"Голосование завершено.",
+        f"Окно для перебития: 24 часа.",
         ephemeral=True,
     )
 
@@ -1854,6 +1873,13 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             pass
         return
 
+    if custom_id.startswith("fveto_"):
+        try:
+            await _handle_button_veto(interaction, int(custom_id.split("_")[1]), forwarded=True)
+        except (ValueError, IndexError):
+            pass
+        return
+
     if custom_id.startswith("vdir_"):
         try:
             parts = custom_id.split("_")
@@ -1861,7 +1887,8 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             direction = parts[2]
             if direction not in ("reject", "confirm"):
                 direction = "reject"
-            await _handle_button_veto_direction(interaction, vote_id, direction)
+            forwarded = len(parts) > 3 and parts[3] == "f"
+            await _handle_button_veto_direction(interaction, vote_id, direction, forwarded=forwarded)
         except (ValueError, IndexError):
             pass
         return
@@ -2153,15 +2180,15 @@ async def _handle_button_revoke(interaction: discord.Interaction, vote_id: int) 
     )
 
 
-def _veto_direction_view(vote_id: int) -> discord.ui.View:
+def _veto_direction_view(vote_id: int, forwarded: bool = False) -> discord.ui.View:
     view = discord.ui.View(timeout=300)
     for direction, label, style, emoji in (
         ("reject", "Отклонить инициативу", discord.ButtonStyle.danger, "\u274c"),
         ("confirm", "Одобрить инициативу", discord.ButtonStyle.success, "\u2705"),
     ):
         btn = discord.ui.Button(
-            label=label,
-            custom_id=f"vdir_{vote_id}_{direction}",
+            label=label + (" (1 ур.)" if forwarded else ""),
+            custom_id=f"vdir_{vote_id}_{direction}" + ("_f" if forwarded else ""),
             style=style,
             emoji=emoji,
         )
@@ -2170,13 +2197,16 @@ def _veto_direction_view(vote_id: int) -> discord.ui.View:
 
 
 class _VetoModal(discord.ui.Modal):
-    def __init__(self, vote_id: int, direction: str):
+    def __init__(self, vote_id: int, direction: str, forwarded: bool = False):
         title = (
             "Вето: отклонить" if direction == "reject" else "Вето: одобрить"
         )
+        if forwarded:
+            title += " (1 ур.)"
         super().__init__(title=title, timeout=300)
         self.vote_id = vote_id
         self.direction = direction
+        self.forwarded = forwarded
         self.reason_input = discord.ui.TextInput(
             label="Причина вето",
             style=discord.TextStyle.paragraph,
@@ -2187,21 +2217,17 @@ class _VetoModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await _execute_veto(
-            interaction, self.vote_id, str(self.reason_input.value), self.direction
+            interaction, self.vote_id, str(self.reason_input.value),
+            self.direction, forwarded=self.forwarded,
         )
 
 
-async def _handle_button_veto(interaction: discord.Interaction, vote_id: int) -> None:
-    if interaction.guild_id is None:
+async def _handle_button_veto(interaction: discord.Interaction, vote_id: int, forwarded: bool = False) -> None:
+    if interaction.guild_id is None or interaction.guild is None or interaction.user is None:
         await interaction.response.send_message("\u274c Только на сервере.", ephemeral=True)
         return
 
-    council_num = _parse_council_number(interaction.user.display_name)
-    if council_num is None:
-        await interaction.response.send_message(
-            "\u274c Вы не член Совета (нет О5-X в нике).", ephemeral=True
-        )
-        return
+    member_roles = [r.id for r in interaction.user.roles]
 
     async with get_session() as session:
         vote = await voting.get_vote_by_id(session, vote_id, interaction.guild_id)
@@ -2210,14 +2236,34 @@ async def _handle_button_veto(interaction: discord.Interaction, vote_id: int) ->
                 "\u274c Голосование не найдено.", ephemeral=True
             )
             return
-        if vote.status not in ("open", "paused"):
+        now = dt.datetime.now(dt.timezone.utc)
+        window_open = (
+            vote.veto_window_expires_at is not None
+            and now <= vote.veto_window_expires_at
+            and vote.status != VoteStatus.CANCELLED
+        )
+        if vote.status not in ("open", "paused") and not window_open:
             await interaction.response.send_message(
-                "\u274c Голосование не активно.", ephemeral=True
+                "\u274c Голосование не активно или окно ВЕТО истекло.", ephemeral=True
             )
             return
-        veto_level = await voting.get_user_veto_level(
-            session, interaction.guild_id, interaction.user.id
-        )
+
+        if forwarded:
+            veto_level = 1
+        else:
+            veto_level = await voting.get_user_veto_level(
+                session, interaction.guild_id, interaction.user.id, member_roles=member_roles
+            )
+
+        if forwarded:
+            presser_level = await voting.get_user_veto_level(
+                session, interaction.guild_id, interaction.user.id, member_roles=member_roles
+            )
+            if presser_level is None:
+                await interaction.response.send_message(
+                    "\u274c У вас нет права ВЕТО.", ephemeral=True
+                )
+                return
 
     if veto_level is None:
         await interaction.response.send_message(
@@ -2227,19 +2273,20 @@ async def _handle_button_veto(interaction: discord.Interaction, vote_id: int) ->
 
     await interaction.response.send_message(
         f"\U0001f6d1 **Вето на голосование #{vote.vote_number}** — выберите направление:",
-        view=_veto_direction_view(vote_id),
+        view=_veto_direction_view(vote_id, forwarded=forwarded),
         ephemeral=True,
     )
 
 
 async def _handle_button_veto_direction(
-    interaction: discord.Interaction, vote_id: int, direction: str
+    interaction: discord.Interaction, vote_id: int, direction: str, forwarded: bool = False
 ) -> None:
-    await interaction.response.send_modal(_VetoModal(vote_id, direction))
+    await interaction.response.send_modal(_VetoModal(vote_id, direction, forwarded=forwarded))
 
 
 async def _execute_veto(
-    interaction: discord.Interaction, vote_id: int, reason: str, direction: str
+    interaction: discord.Interaction, vote_id: int, reason: str, direction: str,
+    forwarded: bool = False,
 ) -> None:
     await interaction.response.defer(ephemeral=True)
 
@@ -2248,18 +2295,42 @@ async def _execute_veto(
         if not vote:
             await interaction.followup.send("\u274c Голосование не найдено.", ephemeral=True)
             return
-        if vote.status not in ("open", "paused"):
-            await interaction.followup.send("\u274c Голосование не активно.", ephemeral=True)
+        now = dt.datetime.now(dt.timezone.utc)
+        window_open = (
+            vote.veto_window_expires_at is not None
+            and now <= vote.veto_window_expires_at
+            and vote.status != VoteStatus.CANCELLED
+        )
+        if vote.status not in ("open", "paused") and not window_open:
+            await interaction.followup.send(
+                "\u274c Голосование не активно или окно ВЕТО истекло.", ephemeral=True
+            )
             return
+
+        member_roles = [r.id for r in interaction.user.roles] if interaction.guild and interaction.user else []
+        presser_level = await voting.get_user_veto_level(
+            session, interaction.guild_id, interaction.user.id, member_roles=member_roles
+        )
+        if presser_level is None:
+            await interaction.followup.send("\u274c У вас нет права ВЕТО.", ephemeral=True)
+            return
+        if forwarded:
+            level = 1
+        else:
+            level = presser_level
 
         res = await voting.apply_veto(
             session, vote, interaction.user.id, reason,
             user_name=interaction.user.display_name, direction=direction,
+            veto_level=level,
         )
         if res is None:
             await interaction.followup.send(
                 "\u274c У вас нет права ВЕТО.", ephemeral=True
             )
+            return
+        if "error" in res:
+            await interaction.followup.send(res["error"], ephemeral=True)
             return
 
         await session.commit()
@@ -2275,7 +2346,7 @@ async def _execute_veto(
         f"\u2705 Вето **{res['roman']}** уровня наложено на голосование #{vote.vote_number}\n"
         f"**Направление:** {res['dir_text']}\n"
         f"**Причина:** {reason}\n"
-        f"Голосование завершено.",
+        f"Окно для перебития: 24 часа.",
         ephemeral=True,
     )
 
@@ -2289,6 +2360,34 @@ async def _iter_role_members(guild: discord.Guild, role: discord.Role):
         for member in role.members:
             if role in member.roles:
                 yield member
+
+
+def _veto_level_from_roles(settings_obj, member_roles) -> int | None:
+    """Высший уровень ВЕТО участника по настроенным ролям (1/2/3)."""
+    role_ids = {r.id for r in member_roles}
+    level = None
+    for lvl, attr in (
+        (1, "veto_role_ids_level1"),
+        (2, "veto_role_ids_level2"),
+        (3, "veto_role_ids_level3"),
+    ):
+        configured = set(getattr(settings_obj, attr, None) or [])
+        if configured & role_ids:
+            level = lvl
+    return level
+
+
+def _resolve_role_id(interaction: discord.Interaction, part: str) -> int | None:
+    part = part.strip()
+    if not part:
+        return None
+    m = re.search(r"<@&(\d+)>", part)
+    if m:
+        return int(m.group(1))
+    try:
+        return int(part)
+    except ValueError:
+        return None
 
 
 def _channel_label(interaction: discord.Interaction, cid: int) -> str:
@@ -2336,18 +2435,22 @@ async def _check_admin_permission(
                 own_session, interaction.guild_id
             )
 
+    # Isolation rule: only operator allowed when isolated
+    isolated = await _is_guild_isolated(interaction.guild_id)
+    if isolated:
+        if settings_obj.operator_access_enabled and settings_obj.operator_user_id == interaction.user.id:
+            return True
+        if not silent:
+            await interaction.response.send_message(_ISOLATION_MESSAGE, ephemeral=True)
+        return False
+
     if settings_obj.operator_access_enabled and settings_obj.operator_user_id == interaction.user.id:
         return True
 
-    if settings_obj.admin_role_id:
-        role = interaction.guild.get_role(settings_obj.admin_role_id)
-        if role and role in interaction.user.roles:
-            return True
-
-    if interaction.guild.owner_id == interaction.user.id:
+    if interaction.user.guild_permissions.administrator:
         return True
 
-    if interaction.user.guild_permissions.administrator:
+    if interaction.guild.owner_id == interaction.user.id:
         return True
 
     if not silent:
@@ -2371,6 +2474,15 @@ async def _check_council_or_admin_permission(
 
     async with get_session() as session:
         settings_obj = await voting.get_or_create_guild_settings(session, interaction.guild_id)
+
+    # Isolation rule: only operator allowed when isolated
+    isolated = await _is_guild_isolated(interaction.guild_id)
+    if isolated:
+        if settings_obj.operator_access_enabled and settings_obj.operator_user_id == interaction.user.id:
+            return True
+        if not silent:
+            await interaction.response.send_message(_ISOLATION_MESSAGE, ephemeral=True)
+        return False
 
     if settings_obj.council_role_id:
         role = interaction.guild.get_role(settings_obj.council_role_id)
@@ -2412,9 +2524,27 @@ async def auto_close_task() -> None:
                     user_name="Система",
                 )
 
+            expired_windows = list(
+                (
+                    await session.execute(
+                        sa_select(VoteModel).where(
+                            VoteModel.status == VoteStatus.COMPLETED,
+                            VoteModel.veto_window_expires_at.isnot(None),
+                            VoteModel.veto_window_expires_at <= now,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if expired_windows:
+                logger.info("auto_close: %d veto windows expired", len(expired_windows))
+
             await session.commit()
 
-            for vote in expired_votes:
+            refresh_targets = set(expired_votes) | set(expired_windows)
+
+            for vote in refresh_targets:
                 try:
                     await voting.refresh_vote_messages(session, vote, bot)
                 except Exception:
@@ -2453,23 +2583,7 @@ async def auto_sync_council_task() -> None:
                 if member.bot:
                     continue
                 council_num = _parse_council_number(member.display_name)
-
-                veto_level = None
-                if council_num is not None:
-                    if council_num == 0:
-                        veto_level = 1
-                    elif council_num == 1:
-                        veto_level = 2
-                    elif council_num == 13:
-                        veto_level = 3
-
-                has_chair = False
-                if gs.chair_role_id:
-                    chair_role = guild.get_role(gs.chair_role_id)
-                    if chair_role and chair_role in member.roles:
-                        has_chair = True
-                if has_chair:
-                    veto_level = 1
+                veto_level = _veto_level_from_roles(gs, member.roles)
 
                 members_data.append({
                     "user_id": member.id,

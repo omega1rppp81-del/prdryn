@@ -120,10 +120,17 @@ async def refresh_vote_messages(
 ) -> int:
     """Перерисовать все опубликованные сообщения голосования по текущему статусу.
 
-    Primary-сообщение получает кнопки только пока статус open; копии в других
-    каналах остаются embed-only. Возвращает число обновлённых сообщений.
+    Primary-сообщение получает полный набор кнопок пока статус open/paused;
+    после завершения — кнопку ВЕТО, пока не истекло 24-часовое окно.
+    Копии в других каналах получают кнопку ВЕТО 1 уровня (forwarded),
+    пока активно голосование или открыто окно ВЕТО. Возвращает число обновлённых.
     """
-    from bot.utils.embeds import build_completed_embed, build_vote_embed, build_vote_view
+    from bot.utils.embeds import (
+        build_completed_embed,
+        build_veto_view,
+        build_vote_embed,
+        build_vote_view,
+    )
 
     result = await session.execute(
         select(Vote)
@@ -132,12 +139,21 @@ async def refresh_vote_messages(
     )
     fresh = result.scalar_one()
 
+    now = dt.datetime.now(dt.timezone.utc)
+    window_open = (
+        fresh.veto_window_expires_at is not None
+        and now <= fresh.veto_window_expires_at
+        and fresh.status != VoteStatus.CANCELLED
+    )
+
     if fresh.status in (VoteStatus.OPEN, VoteStatus.PAUSED):
         embed = await build_vote_embed(fresh, session=session)
-        view = build_vote_view(fresh)
+        primary_view = build_vote_view(fresh)
+        copy_view = build_veto_view(fresh, forwarded=True)
     else:
         embed = await build_completed_embed(fresh, session)
-        view = None
+        primary_view = build_veto_view(fresh, forwarded=False) if window_open else None
+        copy_view = build_veto_view(fresh, forwarded=True) if window_open else None
 
     updated = 0
     for ch_id, msg_id in await get_vote_message_targets(session, fresh):
@@ -147,10 +163,8 @@ async def refresh_vote_messages(
                 ch = await client.fetch_channel(ch_id)
             msg = await ch.fetch_message(msg_id)
             is_primary = fresh.channel_id == ch_id and fresh.message_id == msg_id
-            if is_primary:
-                await msg.edit(embed=embed, view=view)
-            else:
-                await msg.edit(embed=embed)
+            view = primary_view if is_primary else copy_view
+            await msg.edit(embed=embed, view=view)
             updated += 1
         except Exception:
             logger.warning(
@@ -299,8 +313,11 @@ async def open_vote(session: AsyncSession, vote: Vote) -> Vote:
 
 async def complete_vote(session: AsyncSession, vote: Vote, reason: str | None = None) -> Vote:
     vote.status = VoteStatus.COMPLETED
-    vote.actual_end_at = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.timezone.utc)
+    vote.actual_end_at = now
     vote.completion_reason = reason or "Срок голосования истёк"
+    if vote.veto_window_expires_at is None:
+        vote.veto_window_expires_at = now + dt.timedelta(hours=24)
     await session.flush()
     return vote
 
@@ -976,7 +993,7 @@ async def cast_veto(
     for ev in existing:
         if ev.user_id == user_id:
             ev.status = "superseded"
-        elif ev.veto_direction == veto_direction and ev.veto_level >= veto_level:
+        elif veto_level > ev.veto_level:
             ev.status = "overruled"
 
     veto = VoteVeto(
@@ -994,8 +1011,27 @@ async def cast_veto(
 
 
 async def get_user_veto_level(
-    session: AsyncSession, guild_id: int, user_id: int
+    session: AsyncSession, guild_id: int, user_id: int, member_roles: list[int] | None = None
 ) -> int | None:
+    gs_result = await session.execute(
+        select(GuildSettings).where(GuildSettings.guild_id == guild_id)
+    )
+    gs = gs_result.scalar_one_or_none()
+    if gs and member_roles:
+        role_ids = set(member_roles)
+        levels = []
+        v1 = gs.veto_role_ids_level1 or []
+        v2 = gs.veto_role_ids_level2 or []
+        v3 = gs.veto_role_ids_level3 or []
+        if any(r in role_ids for r in v1):
+            levels.append(1)
+        if any(r in role_ids for r in v2):
+            levels.append(2)
+        if any(r in role_ids for r in v3):
+            levels.append(3)
+        if levels:
+            return max(levels)
+
     result = await session.execute(
         select(CouncilMember).where(
             CouncilMember.guild_id == guild_id,
@@ -1016,28 +1052,79 @@ async def apply_veto(
     reason: str,
     user_name: str | None = None,
     direction: str = "reject",
+    veto_level: int | None = None,
 ) -> dict | None:
-    """Накладывает вето и завершает голосование.
+    """Накладывает вето на голосование (или перебивает активное вето выше уровнем).
 
-    Возвращает данные для ответа или None, если у пользователя нет прав вето.
+    Поддерживает вето на активное голосование и на завершённое решение в пределах
+    24-часового окна после завершения (veto_window_expires_at). Более высокий
+    уровень может перебить активное вето более низкого уровня.
+
+    Возвращает dict с данными для ответа или None, если у пользователя нет права вето.
     """
+    from bot.models.models import VoteVeto
     from bot.services import audit
 
-    auto_level = await get_user_veto_level(session, vote.guild_id, user_id)
+    if veto_level is not None:
+        auto_level = veto_level
+    else:
+        auto_level = await get_user_veto_level(session, vote.guild_id, user_id)
     if auto_level is None:
         return None
+
+    now = dt.datetime.now(dt.timezone.utc)
+
+    if vote.status not in (
+        VoteStatus.OPEN,
+        VoteStatus.PAUSED,
+        VoteStatus.COMPLETED,
+    ):
+        return {"error": "\u274c Голосование не активно."}
+
+    if vote.status == VoteStatus.COMPLETED:
+        if vote.veto_window_expires_at is None or now > vote.veto_window_expires_at:
+            return {
+                "error": "\u23f1\ufe0f Окно для наложения ВЕТО (24 часа после завершения) истекло."
+            }
+
+    # Перебить можно только более высоким уровнем
+    active_result = await session.execute(
+        select(VoteVeto).where(
+            VoteVeto.vote_id == vote.id, VoteVeto.status == "active"
+        )
+    )
+    active = [v for v in active_result.scalars().all() if v.user_id != user_id]
+    if active:
+        if not any(auto_level > v.veto_level for v in active):
+            top = max(v.veto_level for v in active)
+            roman = {1: "I", 2: "II", 3: "III"}.get(top, str(top))
+            return {
+                "error": (
+                    f"\U0001f6d1 Уже действует ВЕТО {roman} уровня. "
+                    "Перебить его может только более высокий уровень."
+                )
+            }
+
+    if vote.status in (VoteStatus.OPEN, VoteStatus.PAUSED) and not vote.result_data:
+        await calculate_results(session, vote)
 
     veto = await cast_veto(
         session, vote.id, user_id, reason, user_name,
         veto_level=auto_level, veto_direction=direction,
     )
-    await calculate_results(session, vote)
 
     roman = {1: "I", 2: "II", 3: "III"}.get(auto_level, str(auto_level))
     dir_text = "отклонение" if direction == "reject" else "одобрение"
     veto_reason = f"Вето {roman} ({dir_text}): {reason}"
 
-    await complete_vote(session, vote, reason=veto_reason)
+    if vote.status in (VoteStatus.OPEN, VoteStatus.PAUSED):
+        await complete_vote(session, vote, reason=veto_reason)
+    else:
+        vote.completion_reason = veto_reason
+
+    vote.vetoed_at = now
+    vote.veto_window_expires_at = now + dt.timedelta(hours=24)
+    await session.flush()
 
     await audit.log_action(
         session,

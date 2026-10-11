@@ -263,6 +263,38 @@ async def build_completed_embed(vote: "Vote", session: "AsyncSession | None" = N
             inline=False,
         )
 
+    # ── Veto ──
+    if session is not None:
+        from sqlalchemy import select as sa_select
+
+        from bot.models import VoteVeto
+
+        veto_result = await session.execute(
+            sa_select(VoteVeto)
+            .where(VoteVeto.vote_id == vote.id, VoteVeto.status == "active")
+            .order_by(VoteVeto.created_at.desc())
+        )
+        active_vetoes = list(veto_result.scalars().all())
+        if active_vetoes:
+            roman = {1: "I", 2: "II", 3: "III"}
+            lines = []
+            for v in active_vetoes:
+                lv = roman.get(v.veto_level, str(v.veto_level))
+                dv = "отклонение" if v.veto_direction == "reject" else "одобрение"
+                author = (
+                    f"<@{v.user_id}>"
+                    if vote.anonymity_level in ("open", "anonymous_members")
+                    else "Аноним"
+                )
+                lines.append(f"🛑 **ВЕТО {lv} уровня ({dv})** — {author}")
+                if v.reason:
+                    lines.append(f"> {v.reason[:300]}")
+            embed.add_field(
+                name="── ВЕТО ──",
+                value="\n".join(lines),
+                inline=False,
+            )
+
     # ── Council table (ANSI) ──
     if vote.anonymity_level == "open" and vote.show_voter_list and session is not None:
         table = await _build_council_table(session, vote)
@@ -551,6 +583,20 @@ def build_vote_buttons(vote: "Vote") -> list[discord.ui.Button]:
             )
             buttons.append(btn)
     return buttons
+
+
+def build_veto_view(vote: "Vote", forwarded: bool = False) -> discord.ui.View:
+    """Кнопка ВЕТО. forwarded=True ставится на копии (пересланные) сообщения
+    и всегда применяется как ВЕТО 1 уровня."""
+    view = discord.ui.View(timeout=None)
+    btn = discord.ui.Button(
+        label="ВЕТО" + (" (1 ур.)" if forwarded else ""),
+        custom_id=f"fveto_{vote.id}" if forwarded else f"veto_{vote.id}",
+        style=discord.ButtonStyle.danger,
+        emoji="\U0001f6d1",
+    )
+    view.add_item(btn)
+    return view
 
 
 def build_vote_view(vote: "Vote") -> discord.ui.View | None:
